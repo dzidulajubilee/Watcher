@@ -31,7 +31,7 @@ A lightweight, self-hosted **Intrusion Detection System dashboard** that tails S
 ```bash
 cd /opt/
 git clone https://github.com/dzidulajubilee/Watcher.git
-cd watcher
+cd Watcher
 ```
 
 **2. Set a password**
