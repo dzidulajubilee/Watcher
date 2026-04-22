@@ -177,6 +177,9 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin watcher
 ```bash
 sudo chown -R watcher:watcher /opt/Watcher
 sudo chmod -R 750 /opt/Watcher
+sudo chmod g+rx /var/log/suricata
+sudo chmod g+r /var/log/suricata/eve.json
+sudo chown root:suricata /var/log/suricata/eve.json
 ```
 
 ### 3. Set the password (as root)
@@ -193,7 +196,8 @@ sudo nano /etc/systemd/system/watcher.service
 
 Paste the following — adjust `--eve`, `--host`, and `--port` as needed:
 
-```[Unit]
+```
+[Unit]
 Description=Heimdall IDS Dashboard
 Documentation=https://github.com/dzidulajubilee/Watcher
 After=network.target suricata.service
@@ -235,6 +239,15 @@ CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target
+```
+
+## 5. Make Systemd Aware and Start Service
+
+```
+systemctl daemon-reload
+systemctl enable watcher.service
+systemctl start watcher.service
+systemctl status watcher.service
 ```
 
 ---
