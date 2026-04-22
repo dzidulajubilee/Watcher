@@ -44,12 +44,39 @@ python3 server.py --password mysecretpassword
 python3 server.py
 ```
 
-**4. Open the dashboard**
+**Note**
+
+On the very first run, if no password has been set, Heimdall auto-generates a strong random password and prints it to the console:
+
 ```
-http://localhost:8765/
+========================================================
+  No password set — generated a random one:
+  PASSWORD: xK9mQr2pLwTvNy4
+  Change:   python3 server.py --password <new>
+========================================================
+========================================================
+  RBAC enabled — first Admin account created:
+  Username: admin
+  Password: <generated>
+  Change:   Settings → Users → Edit
+========================================================
 ```
 
-On first run with no existing users, an `admin` account is auto-created and the credentials are printed to the console.
+**4. Open the dashboard**
+
+| URL | Purpose |
+|-----|---------|
+| `http://0.0.0.0:8765/login` | Sign-in page |
+| `http://localhost:8765/` | Live dashboard |
+| `http://localhost:8765/health` | Health check (JSON) |
+
+To set or change the password at any time:
+
+```bash
+python3 server.py --password mysecretpassword
+```
+
+This updates the stored hash and exits. Restart the server normally afterwards.
 
 ---
 
