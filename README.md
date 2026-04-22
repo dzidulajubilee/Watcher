@@ -7,7 +7,7 @@ A lightweight, self-hosted **Intrusion Detection System dashboard** that tails S
 ## Features
 
 - **Real-time alert streaming** via Server-Sent Events — no polling, no websockets
-- **Multi-event support** — alerts, flows, DNS, and HTTP events from Suricata
+- **Multi-event support** — alerts, flows and DNS events from Suricata
 - **Role-Based Access Control (RBAC)** — three roles: `admin`, `analyst`, `viewer`
 - **Webhook notifications** — Slack, Discord, and generic JSON endpoints with per-severity filtering and cooldown suppression
 - **Multiple UI themes** — Night, Light, Midnight Blue, Solarized Dark, Dracula, Nord
@@ -29,7 +29,8 @@ A lightweight, self-hosted **Intrusion Detection System dashboard** that tails S
 
 **1. Clone the repo**
 ```bash
-git clone https://github.com/yourname/watcher.git
+cd /opt/
+git clone https://github.com/dzidulajubilee/Watcher.git
 cd watcher
 ```
 
@@ -136,6 +137,80 @@ Override any value via CLI flags or by editing `config.py` directly.
 
 ---
 
+## Systemd Service (Auto-start)
+
+### 1. Create a dedicated system user
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin watcher
+```
+
+### 2. Ensure the Right Permission
+
+```bash
+sudo chown -R watcher:watcher /opt/watcher
+sudo chmod -R 750 /opt/watcher
+```
+
+### 3. Set the password (as root)
+
+```bash
+sudo -u watcher python3 /opt/watcher/server.py --password <Your secure Password>
+```
+
+### 4. Create the systemd unit file
+
+```bash
+sudo nano /etc/systemd/system/watcher.service
+```
+
+Paste the following — adjust `--eve`, `--host`, and `--port` as needed:
+
+```[Unit]
+Description=Heimdall IDS Dashboard
+Documentation=https://github.com/dzidulajubilee/Watcher
+After=network.target suricata.service
+Wants=suricata.service
+
+[Service]
+Type=simple
+User=watcher
+Group=watcher
+WorkingDirectory=/opt/watcher
+
+ExecStart=/usr/bin/python3 /opt/watcher/server.py \
+    --eve  /var/log/suricata/eve.json \
+    --host 0.0.0.0 \
+    --port 8765 \
+    --db   /opt/watcher/alerts.db \
+    --retain-days 90
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=watcher
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/watcher
+ReadOnlyPaths=/var/log/suricata
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
 
 
 ## License
