@@ -95,11 +95,32 @@ class AlertDB:
         return self._local.conn
 
     def _to_epoch(self, ts: str) -> float:
+        """
+        Parse a Suricata ISO-8601 timestamp to a Unix epoch float.
+
+        Suricata emits timestamps like: 2026-04-22T01:59:00.123456+0000
+          - Microseconds (6 decimal places) instead of the 3 JS/Python %f expects
+          - Timezone offset without colon (+0000 instead of +00:00)
+
+        Both are handled by normalising the string before parsing.
+        Falls back to 0.0 (not time.time()) on failure so callers get a
+        clearly-wrong value rather than silently corrupting retention queries.
+        """
         from datetime import datetime
+        if not ts:
+            return 0.0
+        # Normalise: truncate microseconds to milliseconds, add colon to tz offset
+        normalised = ts
+        import re as _re
+        normalised = _re.sub(r"(\.\d{3})\d+", r"\1", normalised)        # 123456 → 123
+        normalised = _re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", normalised)  # +0000 → +00:00
         for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
-            try: return datetime.strptime(ts, fmt).timestamp()
-            except ValueError: pass
-        return time.time()
+            try:
+                return datetime.strptime(normalised, fmt).timestamp()
+            except ValueError:
+                pass
+        log.warning("_to_epoch: could not parse timestamp %r (normalised: %r)", ts, normalised)
+        return 0.0
 
     # ── Alerts ────────────────────────────────────────────────────────────────
 
@@ -324,11 +345,21 @@ class AlertDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # Allowlist of tables that may be purged — prevents any f-string injection
+    _PURGEABLE_TABLES = ("alerts", "flows", "dns_events", "http_events")
+
+    # Pre-built DELETE statements keyed by table name (no runtime interpolation)
+    _PURGE_SQL = {
+        t: f"DELETE FROM {t} WHERE ts_epoch<?"   # noqa: S608 — safe: table is a literal constant
+        for t in ("alerts", "flows", "dns_events", "http_events")
+    }
+
     def purge_old(self):
         cutoff = time.time() - self.retain_days * 86400
         total  = 0
-        for table in ("alerts","flows","dns_events","http_events"):
-            cur = self._conn().execute(f"DELETE FROM {table} WHERE ts_epoch<?", (cutoff,))
+        for table in self._PURGEABLE_TABLES:
+            sql = self._PURGE_SQL[table]   # lookup, not interpolation at call-time
+            cur = self._conn().execute(sql, (cutoff,))
             total += cur.rowcount
         self._conn().commit()
         if total:
@@ -451,16 +482,31 @@ class AlertDB:
         ).fetchall()
         return [{"severity": r["severity"], "count": r["cnt"]} for r in rows]
 
+    # Pre-built COUNT statements — table names are compile-time constants, never user data
+    _COUNT_SQL = {
+        t: f"SELECT COUNT(*) FROM {t}"
+        for t in ("alerts", "flows", "dns_events", "http_events")
+    }
+    _RECENT_SQL = {
+        t: f"SELECT COUNT(*) FROM {t} WHERE ts_epoch>=?"
+        for t in ("alerts", "flows", "dns_events", "http_events")
+    }
+
     def stats(self) -> dict:
         c      = self._conn()
         cutoff = time.time() - self.retain_days * 86400
-        def _cnt(t):    return c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-        def _recent(t): return c.execute(f"SELECT COUNT(*) FROM {t} WHERE ts_epoch>=?", (cutoff,)).fetchone()[0]
+
+        def _cnt(t: str) -> int:
+            return c.execute(self._COUNT_SQL[t]).fetchone()[0]
+
+        def _recent(t: str) -> int:
+            return c.execute(self._RECENT_SQL[t], (cutoff,)).fetchone()[0]
+
         oldest = c.execute("SELECT MIN(ts) FROM alerts").fetchone()[0]
         return {
-            "alerts": {"total":_cnt("alerts"),     "recent":_recent("alerts")},
-            "flows":  {"total":_cnt("flows"),       "recent":_recent("flows")},
-            "dns":    {"total":_cnt("dns_events"),  "recent":_recent("dns_events")},
-            "http":   {"total":_cnt("http_events"), "recent":_recent("http_events")},
+            "alerts": {"total": _cnt("alerts"),     "recent": _recent("alerts")},
+            "flows":  {"total": _cnt("flows"),       "recent": _recent("flows")},
+            "dns":    {"total": _cnt("dns_events"),  "recent": _recent("dns_events")},
+            "http":   {"total": _cnt("http_events"), "recent": _recent("http_events")},
             "oldest": oldest,
         }
