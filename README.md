@@ -175,14 +175,14 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin watcher
 ### 2. Ensure the Right Permission
 
 ```bash
-sudo chown -R watcher:watcher /opt/watcher
-sudo chmod -R 750 /opt/watcher
+sudo chown -R watcher:watcher /opt/Watcher
+sudo chmod -R 750 /opt/Watcher
 ```
 
 ### 3. Set the password (as root)
 
 ```bash
-sudo -u watcher python3 /opt/watcher/server.py --password <Your secure Password>
+sudo -u watcher python3 /opt/Watcher/server.py --password <Your secure Password>
 ```
 
 ### 4. Create the systemd unit file
@@ -203,13 +203,13 @@ Wants=suricata.service
 Type=simple
 User=watcher
 Group=watcher
-WorkingDirectory=/opt/watcher
+WorkingDirectory=/opt/Watcher
 
-ExecStart=/usr/bin/python3 /opt/watcher/server.py \
+ExecStart=/usr/bin/python3 /opt/Watcher/server.py \
     --eve  /var/log/suricata/eve.json \
     --host 0.0.0.0 \
     --port 8765 \
-    --db   /opt/watcher/alerts.db \
+    --db   /opt/Watcher/alerts.db \
     --retain-days 90
 
 # Restart policy
@@ -227,7 +227,7 @@ SyslogIdentifier=watcher
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/opt/watcher
+ReadWritePaths=/opt/Watcher
 ReadOnlyPaths=/var/log/suricata
 PrivateTmp=yes
 PrivateDevices=yes
