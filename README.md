@@ -194,48 +194,22 @@ sudo -u watcher python3 /opt/Watcher/server.py --password <Your secure Password>
 sudo nano /etc/systemd/system/watcher.service
 ```
 
-Paste the following — adjust `--eve`, `--host`, and `--port` as needed:
+Paste the following
 
 ```
 [Unit]
-Description=Heimdall IDS Dashboard
+Description=Watcher IDS Dashboard
 Documentation=https://github.com/dzidulajubilee/Watcher
 After=network.target suricata.service
 Wants=suricata.service
 
 [Service]
 Type=simple
-User=watcher
-Group=watcher
+User=root                       
 WorkingDirectory=/opt/Watcher
-
-ExecStart=/usr/bin/python3 /opt/Watcher/server.py \
-    --eve  /var/log/suricata/eve.json \
-    --host 0.0.0.0 \
-    --port 8765 \
-    --db   /opt/Watcher/alerts.db \
-    --retain-days 90
-
-# Restart policy
+ExecStart=/usr/bin/python3 /opt/Watcher/server.py
 Restart=on-failure
-RestartSec=5s
-StartLimitIntervalSec=60s
-StartLimitBurst=3
-
-# Logging
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=watcher
-
-# Hardening
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/opt/Watcher
-ReadOnlyPaths=/var/log/suricata
-PrivateTmp=yes
-PrivateDevices=yes
-CapabilityBoundingSet=
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
