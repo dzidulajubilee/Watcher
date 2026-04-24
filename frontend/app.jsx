@@ -97,7 +97,7 @@ function ThemePicker({ theme, onChange }) {
 const { useState, useEffect, useRef } = React;
 
 // ── Constants ────────────────────────────────────────────────────────────────
-const MAX_ALERTS = 2000;
+const MAX_ALERTS = 5000;
 const SSE_URL    = '/events';
 
 const SEV_COLORS = {
