@@ -9,7 +9,12 @@ from pathlib import Path
 DEFAULT_EVE   = "/var/log/suricata/eve.json"
 DEFAULT_PORT  = 8765
 DEFAULT_HOST  = "0.0.0.0"
-DEFAULT_DB    = Path(__file__).parent / "alerts.db"
+
+# ── Databases ─────────────────────────────────────────────────────────────────
+# events.db  — high-volume: alerts, flows, dns_events, http_events, ack_history
+# config.db  — low-write:   auth, sessions, users, webhooks
+DEFAULT_DB        = Path(__file__).parent / "events.db"
+DEFAULT_CONFIG_DB = Path(__file__).parent / "config.db"
 
 # ── Data retention ────────────────────────────────────────────────────────────
 RETAIN_DAYS   = 90      # days to keep alerts in SQLite

@@ -1,19 +1,27 @@
 """
-Watcher IDS Dashboard — Database
-Thread-safe SQLite wrapper for all event types:
-  alerts, flows, dns_events, http_events.
-Each thread gets its own connection via threading.local().
+Watcher IDS Dashboard — Database (Events)
+Thread-safe SQLite wrapper for high-volume event tables:
+  alerts, flows, dns_events, http_events, ack_history.
+
+Kept separate from config.db so heavy write traffic never contends with
+auth/session lookups. See config_db.py for the config-side connection.
 """
 
 import json
 import logging
+import re as _re
 import sqlite3
 import threading
 import time
+from datetime import datetime
 
 from config import RETAIN_DAYS
 
 log = logging.getLogger("watcher.db")
+
+# Pre-compiled timestamp normalisation patterns (used in the hot path)
+_RE_USEC  = _re.compile(r"(\.\d{3})\d+")         # 123456 → 123  (µs→ms)
+_RE_TZ    = _re.compile(r"([+-]\d{2})(\d{2})$")   # +0000  → +00:00
 
 
 class AlertDB:
@@ -22,7 +30,7 @@ class AlertDB:
         self.retain_days = retain_days
         self._local      = threading.local()
         self._conn()
-        log.info("Database: %s  (retain %d days)", self.path, self.retain_days)
+        log.info("Events DB : %s  (retain %d days)", self.path, self.retain_days)
 
     # ── Connection / schema ───────────────────────────────────────────────────
 
@@ -40,21 +48,23 @@ class AlertDB:
                 sig_msg TEXT, category TEXT, severity TEXT, action TEXT, raw_json TEXT,
                 ack_status TEXT NOT NULL DEFAULT 'new',
                 ack_note TEXT, ack_by TEXT, ack_at REAL)""")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_a_ts  ON alerts (ts_epoch)")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_a_sev ON alerts (severity)")
+
+            c.execute("CREATE INDEX IF NOT EXISTS idx_a_ts     ON alerts (ts_epoch)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_a_sev    ON alerts (severity)")
+            # Composite: accelerates time-range + severity filters together
+            c.execute("CREATE INDEX IF NOT EXISTS idx_a_ts_sev ON alerts (ts_epoch, severity)")
 
             # Migration: add ack columns to existing databases
             alert_cols = {r[1] for r in c.execute("PRAGMA table_info(alerts)").fetchall()}
-            if "ack_status" not in alert_cols:
-                c.execute("ALTER TABLE alerts ADD COLUMN ack_status TEXT NOT NULL DEFAULT 'new'")
-            if "ack_note" not in alert_cols:
-                c.execute("ALTER TABLE alerts ADD COLUMN ack_note TEXT")
-            if "ack_by" not in alert_cols:
-                c.execute("ALTER TABLE alerts ADD COLUMN ack_by TEXT")
-            if "ack_at" not in alert_cols:
-                c.execute("ALTER TABLE alerts ADD COLUMN ack_at REAL")
+            for col, ddl in (
+                ("ack_status", "ALTER TABLE alerts ADD COLUMN ack_status TEXT NOT NULL DEFAULT 'new'"),
+                ("ack_note",   "ALTER TABLE alerts ADD COLUMN ack_note TEXT"),
+                ("ack_by",     "ALTER TABLE alerts ADD COLUMN ack_by TEXT"),
+                ("ack_at",     "ALTER TABLE alerts ADD COLUMN ack_at REAL"),
+            ):
+                if col not in alert_cols:
+                    c.execute(ddl)
 
-            # Acknowledgement history — one row per status change per alert
             c.execute("""CREATE TABLE IF NOT EXISTS ack_history (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 alert_id   TEXT    NOT NULL,
@@ -98,47 +108,39 @@ class AlertDB:
         """
         Parse a Suricata ISO-8601 timestamp to a Unix epoch float.
 
-        Suricata emits timestamps like: 2026-04-22T01:59:00.123456+0000
-          - Microseconds (6 decimal places) instead of the 3 JS/Python %f expects
-          - Timezone offset without colon (+0000 instead of +00:00)
-
-        Both are handled by normalising the string before parsing.
-        Falls back to 0.0 (not time.time()) on failure so callers get a
-        clearly-wrong value rather than silently corrupting retention queries.
+        Uses module-level compiled regexes (not re-imported per call).
+        Falls back to 0.0 on any parse failure.
         """
-        from datetime import datetime
         if not ts:
             return 0.0
-        # Normalise: truncate microseconds to milliseconds, add colon to tz offset
-        normalised = ts
-        import re as _re
-        normalised = _re.sub(r"(\.\d{3})\d+", r"\1", normalised)        # 123456 → 123
-        normalised = _re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", normalised)  # +0000 → +00:00
+        normalised = _RE_USEC.sub(r"\1", ts)
+        normalised = _RE_TZ.sub(r"\1:\2", normalised)
         for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
             try:
                 return datetime.strptime(normalised, fmt).timestamp()
             except ValueError:
                 pass
-        log.warning("_to_epoch: could not parse timestamp %r (normalised: %r)", ts, normalised)
+        log.warning("_to_epoch: could not parse %r (normalised: %r)", ts, normalised)
         return 0.0
 
     # ── Alerts ────────────────────────────────────────────────────────────────
 
     def insert(self, alert: dict):
         try:
-            self._conn().execute(
+            c = self._conn()
+            c.execute(
                 """INSERT OR IGNORE INTO alerts
                    (id,ts,ts_epoch,src_ip,src_port,dst_ip,dst_port,
                     proto,iface,flow_id,sig_id,sig_msg,category,severity,action,raw_json)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (alert["id"], alert.get("ts",""), self._to_epoch(alert.get("ts","")),
-                 alert.get("src_ip",""), alert.get("src_port",0),
-                 alert.get("dst_ip",""), alert.get("dst_port",0),
-                 alert.get("proto",""), alert.get("iface",""), alert.get("flow_id",0),
-                 alert.get("sig_id",0), alert.get("sig_msg",""), alert.get("category",""),
-                 alert.get("severity","info"), alert.get("action","allowed"),
-                 json.dumps(alert.get("raw",{}))))
-            self._conn().commit()
+                (alert["id"], alert.get("ts", ""), self._to_epoch(alert.get("ts", "")),
+                 alert.get("src_ip", ""), alert.get("src_port", 0),
+                 alert.get("dst_ip", ""), alert.get("dst_port", 0),
+                 alert.get("proto", ""), alert.get("iface", ""), alert.get("flow_id", 0),
+                 alert.get("sig_id", 0), alert.get("sig_msg", ""), alert.get("category", ""),
+                 alert.get("severity", "info"), alert.get("action", "allowed"),
+                 json.dumps(alert.get("raw", {}))))
+            c.commit()
         except sqlite3.Error as e:
             log.warning("DB insert (alert): %s", e)
 
@@ -153,40 +155,43 @@ class AlertDB:
         result = []
         for row in rows:
             d = dict(row)
-            try: d["raw"] = json.loads(d.pop("raw_json","{}"))
-            except: d["raw"] = {}
+            try:
+                d["raw"] = json.loads(d.pop("raw_json", "{}"))
+            except Exception:
+                d["raw"] = {}
             result.append(d)
         return result
 
     # ── Flows ─────────────────────────────────────────────────────────────────
 
     def insert_flow(self, evt: dict):
-        f  = evt.get("flow", {})
-        ts = evt.get("timestamp", "")
+        f   = evt.get("flow", {})
+        ts  = evt.get("timestamp", "")
         dur = 0.0
         try:
-            from datetime import datetime
-            t1 = datetime.fromisoformat(f.get("start","").replace("+0000","+00:00"))
-            t2 = datetime.fromisoformat(f.get("end",  "").replace("+0000","+00:00"))
+            t1  = datetime.fromisoformat(f.get("start", "").replace("+0000", "+00:00"))
+            t2  = datetime.fromisoformat(f.get("end",   "").replace("+0000", "+00:00"))
             dur = (t2 - t1).total_seconds()
-        except Exception: pass
+        except Exception:
+            pass
         try:
-            self._conn().execute(
+            c = self._conn()
+            c.execute(
                 """INSERT OR IGNORE INTO flows
                    (flow_id,ts,ts_epoch,src_ip,src_port,dst_ip,dst_port,
                     proto,app_proto,iface,pkts_toserver,pkts_toclient,
                     bytes_toserver,bytes_toclient,duration_s,state,reason,alerted)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (evt.get("flow_id",0), ts, self._to_epoch(ts),
-                 evt.get("src_ip",""), evt.get("src_port",0),
-                 evt.get("dest_ip",""), evt.get("dest_port",0),
-                 evt.get("proto","").upper(), evt.get("app_proto",""),
-                 evt.get("in_iface",""),
-                 f.get("pkts_toserver",0), f.get("pkts_toclient",0),
-                 f.get("bytes_toserver",0), f.get("bytes_toclient",0),
-                 dur, f.get("state",""), f.get("reason",""),
+                (evt.get("flow_id", 0), ts, self._to_epoch(ts),
+                 evt.get("src_ip", ""), evt.get("src_port", 0),
+                 evt.get("dest_ip", ""), evt.get("dest_port", 0),
+                 evt.get("proto", "").upper(), evt.get("app_proto", ""),
+                 evt.get("in_iface", ""),
+                 f.get("pkts_toserver", 0), f.get("pkts_toclient", 0),
+                 f.get("bytes_toserver", 0), f.get("bytes_toclient", 0),
+                 dur, f.get("state", ""), f.get("reason", ""),
                  1 if f.get("alerted") else 0))
-            self._conn().commit()
+            c.commit()
         except sqlite3.Error as e:
             log.warning("DB insert (flow): %s", e)
 
@@ -203,24 +208,25 @@ class AlertDB:
     # ── DNS ───────────────────────────────────────────────────────────────────
 
     def insert_dns(self, evt: dict):
-        d   = evt.get("dns", {})
-        ts  = evt.get("timestamp", "")
-        uid = f"{evt.get('flow_id',0)}-{d.get('tx_id',0)}-{d.get('type','')}"
+        d    = evt.get("dns", {})
+        ts   = evt.get("timestamp", "")
+        uid  = f"{evt.get('flow_id',0)}-{d.get('tx_id',0)}-{d.get('type','')}"
         answers_json = json.dumps(d.get("answers", d.get("grouped", {})) or [])
         try:
-            self._conn().execute(
+            c = self._conn()
+            c.execute(
                 """INSERT OR IGNORE INTO dns_events
                    (id,ts,ts_epoch,src_ip,src_port,dst_ip,dst_port,
                     iface,flow_id,tx_id,dns_type,rrname,rrtype,rcode,ttl,answers)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (uid, ts, self._to_epoch(ts),
-                 evt.get("src_ip",""), evt.get("src_port",0),
-                 evt.get("dest_ip",""), evt.get("dest_port",0),
-                 evt.get("in_iface",""), evt.get("flow_id",0),
-                 d.get("tx_id",0), d.get("type",""),
-                 d.get("rrname",""), d.get("rrtype",""),
-                 d.get("rcode",""), d.get("ttl",0), answers_json))
-            self._conn().commit()
+                 evt.get("src_ip", ""), evt.get("src_port", 0),
+                 evt.get("dest_ip", ""), evt.get("dest_port", 0),
+                 evt.get("in_iface", ""), evt.get("flow_id", 0),
+                 d.get("tx_id", 0), d.get("type", ""),
+                 d.get("rrname", ""), d.get("rrtype", ""),
+                 d.get("rcode", ""), d.get("ttl", 0), answers_json))
+            c.commit()
         except sqlite3.Error as e:
             log.warning("DB insert (dns): %s", e)
 
@@ -234,8 +240,10 @@ class AlertDB:
         result = []
         for row in rows:
             d = dict(row)
-            try: d["answers"] = json.loads(d.get("answers") or "[]")
-            except: d["answers"] = []
+            try:
+                d["answers"] = json.loads(d.get("answers") or "[]")
+            except Exception:
+                d["answers"] = []
             result.append(d)
         return result
 
@@ -246,23 +254,24 @@ class AlertDB:
         ts  = evt.get("timestamp", "")
         uid = f"{evt.get('flow_id',0)}-{evt.get('tx_id',0)}-http"
         try:
-            self._conn().execute(
+            c = self._conn()
+            c.execute(
                 """INSERT OR IGNORE INTO http_events
                    (id,ts,ts_epoch,src_ip,src_port,dst_ip,dst_port,
                     iface,flow_id,hostname,url,method,status,
                     user_agent,content_type,req_bytes,resp_bytes,protocol)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (uid, ts, self._to_epoch(ts),
-                 evt.get("src_ip",""), evt.get("src_port",0),
-                 evt.get("dest_ip",""), evt.get("dest_port",0),
-                 evt.get("in_iface",""), evt.get("flow_id",0),
-                 h.get("hostname",""), h.get("url",""),
-                 h.get("http_method",""), h.get("status",0),
-                 h.get("http_user_agent",""), h.get("http_content_type",""),
-                 h.get("request_headers_raw_len", h.get("length",0)),
-                 h.get("response_headers_raw_len", h.get("response_len",0)),
-                 h.get("protocol","")))
-            self._conn().commit()
+                 evt.get("src_ip", ""), evt.get("src_port", 0),
+                 evt.get("dest_ip", ""), evt.get("dest_port", 0),
+                 evt.get("in_iface", ""), evt.get("flow_id", 0),
+                 h.get("hostname", ""), h.get("url", ""),
+                 h.get("http_method", ""), h.get("status", 0),
+                 h.get("http_user_agent", ""), h.get("http_content_type", ""),
+                 h.get("request_headers_raw_len", h.get("length", 0)),
+                 h.get("response_headers_raw_len", h.get("response_len", 0)),
+                 h.get("protocol", "")))
+            c.commit()
         except sqlite3.Error as e:
             log.warning("DB insert (http): %s", e)
 
@@ -276,32 +285,31 @@ class AlertDB:
             (cutoff, limit)).fetchall()
         return [dict(r) for r in rows]
 
-    # ── Maintenance ───────────────────────────────────────────────────────────
-
+    # ── Acknowledgement ───────────────────────────────────────────────────────
 
     def acknowledge(self, alert_id: str, status: str, note: str = "",
                     username: str = "") -> bool:
         """
         Set the ack_status on an alert and append an ack_history entry.
         Valid statuses: new | acknowledged | false_positive | investigating
-        Returns True if the alert was found and updated.
         """
         VALID = {"new", "acknowledged", "false_positive", "investigating"}
         if status not in VALID:
             return False
-        now = time.time()
-        c   = self._conn()
-        cur = c.execute(
-            """UPDATE alerts
-               SET ack_status=?, ack_note=?, ack_by=?, ack_at=?
+        now      = time.time()
+        note_val = note.strip() or None
+        user_val = username or None
+        c        = self._conn()
+        cur      = c.execute(
+            """UPDATE alerts SET ack_status=?, ack_note=?, ack_by=?, ack_at=?
                WHERE id=?""",
-            (status, note.strip() or None, username or None, now, alert_id)
+            (status, note_val, user_val, now, alert_id),
         )
         if cur.rowcount > 0:
             c.execute(
                 """INSERT INTO ack_history (alert_id, status, note, username, changed_at)
                    VALUES (?, ?, ?, ?, ?)""",
-                (alert_id, status, note.strip() or None, username or None, now)
+                (alert_id, status, note_val, user_val, now),
             )
         c.commit()
         return cur.rowcount > 0
@@ -309,29 +317,41 @@ class AlertDB:
     def bulk_acknowledge(self, alert_ids: list, status: str, note: str = "",
                          username: str = "") -> int:
         """
-        Acknowledge multiple alerts in one call.
+        Acknowledge multiple alerts efficiently using a single UPDATE statement
+        (IN clause) and a single executemany for history inserts.
         Returns the number of alerts actually updated.
         """
         VALID = {"new", "acknowledged", "false_positive", "investigating"}
         if status not in VALID or not alert_ids:
             return 0
-        now     = time.time()
-        c       = self._conn()
-        updated = 0
-        for aid in alert_ids:
-            cur = c.execute(
-                """UPDATE alerts
-                   SET ack_status=?, ack_note=?, ack_by=?, ack_at=?
-                   WHERE id=?""",
-                (status, note.strip() or None, username or None, now, aid)
+
+        now      = time.time()
+        note_val = note.strip() or None
+        user_val = username or None
+        c        = self._conn()
+
+        # Single UPDATE for all matching IDs — O(1) statements instead of O(N)
+        placeholders = ",".join(["?"] * len(alert_ids))
+        cur = c.execute(
+            f"UPDATE alerts SET ack_status=?, ack_note=?, ack_by=?, ack_at=? "
+            f"WHERE id IN ({placeholders})",
+            [status, note_val, user_val, now, *alert_ids],
+        )
+        updated = cur.rowcount
+
+        if updated > 0:
+            # Re-query only the IDs that were actually touched (ack_at = now)
+            # so ack_history never gets phantom rows for missing alert IDs.
+            matched = c.execute(
+                f"SELECT id FROM alerts WHERE id IN ({placeholders}) AND ack_at=?",
+                [*alert_ids, now],
+            ).fetchall()
+            c.executemany(
+                """INSERT INTO ack_history (alert_id, status, note, username, changed_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                [(r["id"], status, note_val, user_val, now) for r in matched],
             )
-            if cur.rowcount > 0:
-                c.execute(
-                    """INSERT INTO ack_history (alert_id, status, note, username, changed_at)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (aid, status, note.strip() or None, username or None, now)
-                )
-                updated += 1
+
         c.commit()
         return updated
 
@@ -341,74 +361,63 @@ class AlertDB:
             """SELECT status, note, username, changed_at
                FROM ack_history WHERE alert_id=?
                ORDER BY changed_at DESC""",
-            (alert_id,)
+            (alert_id,),
         ).fetchall()
         return [dict(r) for r in rows]
 
-    # Allowlist of tables that may be purged — prevents any f-string injection
-    _PURGEABLE_TABLES = ("alerts", "flows", "dns_events", "http_events")
+    # ── Maintenance ───────────────────────────────────────────────────────────
 
-    # Pre-built DELETE statements keyed by table name (no runtime interpolation)
+    _PURGEABLE_TABLES = ("alerts", "flows", "dns_events", "http_events")
     _PURGE_SQL = {
-        t: f"DELETE FROM {t} WHERE ts_epoch<?"   # noqa: S608 — safe: table is a literal constant
+        t: f"DELETE FROM {t} WHERE ts_epoch<?"
         for t in ("alerts", "flows", "dns_events", "http_events")
     }
 
     def purge_old(self):
         cutoff = time.time() - self.retain_days * 86400
         total  = 0
+        c      = self._conn()
         for table in self._PURGEABLE_TABLES:
-            sql = self._PURGE_SQL[table]   # lookup, not interpolation at call-time
-            cur = self._conn().execute(sql, (cutoff,))
+            cur    = c.execute(self._PURGE_SQL[table], (cutoff,))
             total += cur.rowcount
-        self._conn().commit()
+        c.commit()
         if total:
             log.info("Purged %d total rows older than %d days.", total, self.retain_days)
 
     def clear_all(self) -> int:
-        cur = self._conn().execute("DELETE FROM alerts")
-        self._conn().commit()
+        c   = self._conn()
+        cur = c.execute("DELETE FROM alerts")
+        c.commit()
         log.info("Alerts cleared — %d rows deleted.", cur.rowcount)
         return cur.rowcount
 
     def clear_flows(self) -> int:
-        """Delete every flow event. Returns count deleted."""
-        cur = self._conn().execute("DELETE FROM flows")
-        self._conn().commit()
+        c   = self._conn()
+        cur = c.execute("DELETE FROM flows")
+        c.commit()
         log.info("Flows cleared — %d rows deleted.", cur.rowcount)
         return cur.rowcount
 
     def clear_dns(self) -> int:
-        """Delete every DNS event. Returns count deleted."""
-        cur = self._conn().execute("DELETE FROM dns_events")
-        self._conn().commit()
+        c   = self._conn()
+        cur = c.execute("DELETE FROM dns_events")
+        c.commit()
         log.info("DNS events cleared — %d rows deleted.", cur.rowcount)
         return cur.rowcount
-
 
     # ── Chart data ────────────────────────────────────────────────────────────
 
     def chart_top_talkers(self, limit: int = 10, days: int = 1) -> list[dict]:
-        """Top source IPs by alert count over the last `days` days."""
         cutoff = time.time() - days * 86400
         rows = self._conn().execute(
             """SELECT src_ip, COUNT(*) as cnt
                FROM alerts WHERE ts_epoch >= ? AND src_ip != ''
                GROUP BY src_ip ORDER BY cnt DESC LIMIT ?""",
-            (cutoff, limit)
+            (cutoff, limit),
         ).fetchall()
         return [{"ip": r["src_ip"], "count": r["cnt"]} for r in rows]
 
     def chart_alert_trend(self, hours: int = 24) -> list[dict]:
-        """
-        Alert counts bucketed by hour for the last `hours` hours.
-        Returns a list of {ts, count} dicts ordered oldest → newest.
-
-        The SQL bucket key is CAST((ts_epoch - cutoff) / 3600 AS INTEGER),
-        so bucket 0 = first hour after cutoff (oldest), bucket N-1 = most
-        recent hour.  We iterate h = 0..hours-1 and look up bucket h directly
-        so the data order matches the label order.
-        """
         now    = time.time()
         cutoff = now - hours * 3600
         rows   = self._conn().execute(
@@ -418,25 +427,17 @@ class AlertDB:
                WHERE  ts_epoch >= ?
                GROUP  BY bucket
                ORDER  BY bucket ASC""",
-            (cutoff, cutoff)
+            (cutoff, cutoff),
         ).fetchall()
         buckets = {r["bucket"]: r["cnt"] for r in rows}
-        result  = []
-        for h in range(hours):
-            # h=0 → oldest slot (cutoff), h=hours-1 → most recent slot
-            slot_epoch = cutoff + h * 3600
-            result.append({
-                "ts":    time.strftime("%H:%M", time.localtime(slot_epoch)),
-                "epoch": int(slot_epoch),
-                "count": buckets.get(h, 0),
-            })
-        return result
+        return [
+            {"ts":    time.strftime("%H:%M", time.localtime(cutoff + h * 3600)),
+             "epoch": int(cutoff + h * 3600),
+             "count": buckets.get(h, 0)}
+            for h in range(hours)
+        ]
 
     def chart_alert_trend_days(self, days: int = 7) -> list[dict]:
-        """
-        Alert counts bucketed by day for the last `days` days.
-        Returns a list of {ts, count} dicts ordered oldest → newest.
-        """
         now    = time.time()
         cutoff = now - days * 86400
         rows   = self._conn().execute(
@@ -446,43 +447,37 @@ class AlertDB:
                WHERE  ts_epoch >= ?
                GROUP  BY bucket
                ORDER  BY bucket ASC""",
-            (cutoff, cutoff)
+            (cutoff, cutoff),
         ).fetchall()
         buckets = {r["bucket"]: r["cnt"] for r in rows}
-        result  = []
-        for d in range(days):
-            slot_epoch = cutoff + d * 86400
-            result.append({
-                "ts":    time.strftime("%b %d", time.localtime(slot_epoch)),
-                "epoch": int(slot_epoch),
-                "count": buckets.get(d, 0),
-            })
-        return result
+        return [
+            {"ts":    time.strftime("%b %d", time.localtime(cutoff + d * 86400)),
+             "epoch": int(cutoff + d * 86400),
+             "count": buckets.get(d, 0)}
+            for d in range(days)
+        ]
 
     def chart_by_category(self, days: int = 1) -> list[dict]:
-        """Alert counts grouped by category for the last `days` days."""
         cutoff = time.time() - days * 86400
         rows = self._conn().execute(
             """SELECT COALESCE(NULLIF(category,''), 'Uncategorized') as cat,
                       COUNT(*) as cnt
                FROM alerts WHERE ts_epoch >= ?
                GROUP BY cat ORDER BY cnt DESC LIMIT 12""",
-            (cutoff,)
+            (cutoff,),
         ).fetchall()
         return [{"category": r["cat"], "count": r["cnt"]} for r in rows]
 
     def chart_by_severity(self, days: int = 1) -> list[dict]:
-        """Alert counts grouped by severity for the last `days` days."""
         cutoff = time.time() - days * 86400
         rows = self._conn().execute(
             """SELECT severity, COUNT(*) as cnt
                FROM alerts WHERE ts_epoch >= ?
                GROUP BY severity ORDER BY cnt DESC""",
-            (cutoff,)
+            (cutoff,),
         ).fetchall()
         return [{"severity": r["severity"], "count": r["cnt"]} for r in rows]
 
-    # Pre-built COUNT statements — table names are compile-time constants, never user data
     _COUNT_SQL = {
         t: f"SELECT COUNT(*) FROM {t}"
         for t in ("alerts", "flows", "dns_events", "http_events")
@@ -496,17 +491,14 @@ class AlertDB:
         c      = self._conn()
         cutoff = time.time() - self.retain_days * 86400
 
-        def _cnt(t: str) -> int:
-            return c.execute(self._COUNT_SQL[t]).fetchone()[0]
-
-        def _recent(t: str) -> int:
-            return c.execute(self._RECENT_SQL[t], (cutoff,)).fetchone()[0]
+        def _cnt(t):    return c.execute(self._COUNT_SQL[t]).fetchone()[0]
+        def _recent(t): return c.execute(self._RECENT_SQL[t], (cutoff,)).fetchone()[0]
 
         oldest = c.execute("SELECT MIN(ts) FROM alerts").fetchone()[0]
         return {
-            "alerts": {"total": _cnt("alerts"),     "recent": _recent("alerts")},
-            "flows":  {"total": _cnt("flows"),       "recent": _recent("flows")},
-            "dns":    {"total": _cnt("dns_events"),  "recent": _recent("dns_events")},
-            "http":   {"total": _cnt("http_events"), "recent": _recent("http_events")},
+            "alerts": {"total": _cnt("alerts"),      "recent": _recent("alerts")},
+            "flows":  {"total": _cnt("flows"),        "recent": _recent("flows")},
+            "dns":    {"total": _cnt("dns_events"),   "recent": _recent("dns_events")},
+            "http":   {"total": _cnt("http_events"),  "recent": _recent("http_events")},
             "oldest": oldest,
         }

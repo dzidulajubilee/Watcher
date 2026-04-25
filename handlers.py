@@ -21,8 +21,8 @@ log = logging.getLogger("watcher.http")
 class Handler(BaseHTTPRequestHandler):
     """
     Single handler class wired to the ThreadedHTTPServer.
-    Dependencies (db, auth, registry) are injected as class attributes
-    by server.py before the server starts.
+    Dependencies (db, auth, registry, wdb, um) are injected as class
+    attributes by server.py before the server starts.
 
     Routes
     ------
@@ -35,28 +35,31 @@ class Handler(BaseHTTPRequestHandler):
     GET  /flows         → JSON flow events (requires auth)
     GET  /dns           → JSON DNS events (requires auth)
     GET  /http          → JSON HTTP events (requires auth)
-    DELETE /alerts      → wipe database (requires auth)
-    DELETE /flows       → wipe flows table (requires auth)
-    DELETE /dns         → wipe dns_events table (requires auth)
+    DELETE /alerts      → wipe alerts table (requires admin)
+    DELETE /flows       → wipe flows table (requires admin)
+    DELETE /dns         → wipe dns_events table (requires admin)
     GET  /charts        → JSON chart data (requires auth)
     GET  /health        → JSON status (requires auth)
     GET  /webhooks      → list all webhooks (requires auth)
-    POST /webhooks      → create webhook (requires auth)
-    PUT  /webhooks/<id> → update webhook (requires auth)
-    DELETE /webhooks/<id> → delete webhook (requires auth)
-    POST /webhooks/<id>/test → fire a test alert (requires auth)
-    GET  /frontend/*    → static files: JS, CSS (requires auth)
+    POST /webhooks      → create webhook (requires admin)
+    PUT  /webhooks/<id> → update webhook (requires admin)
+    DELETE /webhooks/<id> → delete webhook (requires admin)
+    POST /webhooks/<id>/test → fire a test alert (requires admin)
+    GET  /users         → list users (requires admin)
+    POST /users         → create user (requires admin)
+    PUT  /users/<id>    → update user (requires admin)
+    DELETE /users/<id>  → delete user (requires admin)
+    GET  /me            → current session info
+    GET  /frontend/*    → static files (requires auth)
     """
 
     # Injected by server.py
     db       = None
     auth     = None
     registry = None
-    wdb      = None   # WebhookDB instance
-    um       = None   # UserManager instance
+    wdb      = None
+    um       = None
 
-    # Suppress Python's default "Server: BaseHTTP/x Python/x" header
-    # which triggers Suricata SID 2034635.
     server_version = ""
     sys_version    = ""
 
@@ -64,14 +67,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         first = str(args[0]) if args else ""
-        # Suppress per-request noise for long-lived SSE connections
         if "/events" not in first:
             log.info("%s %s", self.address_string(), fmt % args)
 
     # ── Session helpers ───────────────────────────────────────────────────────
 
     def _token(self) -> str:
-        """Extract session token from the Cookie header."""
         raw = self.headers.get("Cookie", "")
         if not raw:
             return ""
@@ -83,23 +84,16 @@ class Handler(BaseHTTPRequestHandler):
             return ""
 
     def _session(self) -> dict | None:
-        """Return the session dict {token, username, role} or None."""
         return self.auth.get_session(self._token())
 
     def _authed(self) -> bool:
         return self._session() is not None
 
     def _role(self) -> str:
-        """Return the role of the current session, or '' if unauthenticated."""
         s = self._session()
         return s["role"] if s else ""
 
     def _require_role(self, *roles: str) -> bool:
-        """
-        Return True if authenticated AND role is in `roles`.
-        Sends 403 Forbidden (not 401) so the frontend can distinguish
-        'not logged in' from 'logged in but not allowed'.
-        """
         if not self._authed():
             self._json({"error": "Unauthorized"}, 401)
             return False
@@ -108,11 +102,9 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    # Files under /frontend/ that must be publicly accessible
     _PUBLIC_FRONTEND = {"/frontend/login.js"}
 
     def _require_auth(self) -> bool:
-        """Require any valid session — role not checked here."""
         if self._authed():
             return True
         p = urlparse(self.path).path
@@ -137,8 +129,23 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, data: dict, status: int = 200):
         body = json.dumps(data).encode()
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type",   "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json_body(self, data, status: int = 200):
+        """
+        Shared helper for data endpoints that return potentially large JSON
+        payloads with no-cache headers.  Centralises the encode/header/write
+        pattern that was previously duplicated across _serve_alerts,
+        _serve_table, and _serve_charts.
+        """
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type",   "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control",  "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
@@ -148,7 +155,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         data = path.read_bytes()
         self.send_response(200)
-        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Type",   content_type)
         self.send_header("Content-Length", str(len(data)))
         if no_cache:
             self.send_header("Cache-Control", "no-cache")
@@ -181,7 +188,6 @@ class Handler(BaseHTTPRequestHandler):
         if not self._require_auth():
             return
 
-        # Authenticated routes
         if p.path in ("/", "/index.html"):
             self._file(FRONTEND_DIR / "index.html", "text/html; charset=utf-8")
         elif p.path == "/events":
@@ -198,15 +204,15 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_charts(qs)
         elif re.match(r"^/alerts/[^/]+/ack/history$", p.path):
             alert_id = p.path.split("/")[2]
-            self._json(self.db.fetch_ack_history(alert_id))
+            self._send_json_body(self.db.fetch_ack_history(alert_id))
         elif p.path == "/webhooks":
-            self._json(self.wdb.get_all())
+            self._send_json_body(self.wdb.get_all())
         elif p.path == "/me":
             s = self._session()
             self._json({"username": s["username"], "role": s["role"]})
         elif p.path == "/users":
             if not self._require_role("admin"): return
-            self._json(self.um.get_all())
+            self._send_json_body(self.um.get_all())
         elif p.path == "/health":
             self._json({
                 "status":  "ok",
@@ -231,14 +237,12 @@ class Handler(BaseHTTPRequestHandler):
         elif p.path == "/alerts/bulk-ack":
             self._bulk_ack_alerts()
         elif re.match(r"^/alerts/[^/]+/ack$", p.path):
-            alert_id = p.path.split("/")[2]
-            self._ack_alert(alert_id)
+            self._ack_alert(p.path.split("/")[2])
         elif p.path == "/webhooks":
             self._webhook_create()
         elif p.path.startswith("/webhooks/") and p.path.endswith("/test"):
             try:
-                wid = int(p.path.split("/")[2])
-                self._webhook_test(wid)
+                self._webhook_test(int(p.path.split("/")[2]))
             except (ValueError, IndexError):
                 self.send_error(400)
         else:
@@ -250,14 +254,12 @@ class Handler(BaseHTTPRequestHandler):
         p = urlparse(self.path)
         if p.path.startswith("/users/"):
             try:
-                uid = int(p.path.split("/")[2])
-                self._user_update(uid)
+                self._user_update(int(p.path.split("/")[2]))
             except (ValueError, IndexError):
                 self.send_error(400)
         elif p.path.startswith("/webhooks/"):
             try:
-                wid = int(p.path.split("/")[2])
-                self._webhook_update(wid)
+                self._webhook_update(int(p.path.split("/")[2]))
             except (ValueError, IndexError):
                 self.send_error(400)
         else:
@@ -278,8 +280,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"deleted": self.db.clear_dns()})
         elif p.path.startswith("/users/"):
             try:
-                uid = int(p.path.split("/")[2])
-                self._user_delete(uid)
+                self._user_delete(int(p.path.split("/")[2]))
             except (ValueError, IndexError):
                 self.send_error(400)
         elif p.path.startswith("/webhooks/"):
@@ -303,20 +304,15 @@ class Handler(BaseHTTPRequestHandler):
     }
 
     def _serve_static(self, url_path: str):
-        """Serve files from the frontend/ directory."""
-        # Strip leading /frontend/ and resolve safely inside FRONTEND_DIR
-        rel = url_path.lstrip("/").removeprefix("frontend/")
+        rel    = url_path.lstrip("/").removeprefix("frontend/")
         target = (FRONTEND_DIR / rel).resolve()
-
-        # Security: prevent directory traversal
         try:
             target.relative_to(FRONTEND_DIR.resolve())
         except ValueError:
             self.send_error(403)
             return
-
-        suffix  = target.suffix.lower()
-        ctype   = self._MIME.get(suffix, "application/octet-stream")
+        suffix   = target.suffix.lower()
+        ctype    = self._MIME.get(suffix, "application/octet-stream")
         no_cache = suffix in (".html", ".jsx")
         self._file(target, ctype, no_cache=no_cache)
 
@@ -324,22 +320,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_login(self):
         try:
-            n    = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(n))
+            n        = int(self.headers.get("Content-Length", 0))
+            body     = json.loads(self.rfile.read(n))
             username = body.get("username", "").strip()
             pw       = body.get("password", "")
         except Exception:
             self._json({"error": "Bad request"}, 400)
             return
 
-        # ── Primary: RBAC user login ──────────────────────────────────────────
         user = self.um.authenticate(username, pw) if username else None
 
-        # ── Fallback: single-password (logs in as admin with username 'admin') ─
         if user is None and not username and self.auth.check_password(pw):
             user = {"username": "admin", "role": "admin"}
 
-        # ── Also accept: username='admin', single-password ───────────────────
         if user is None and username.lower() == "admin" and self.auth.check_password(pw):
             user = {"username": "admin", "role": "admin"}
 
@@ -381,101 +374,25 @@ class Handler(BaseHTTPRequestHandler):
     # ── Data endpoints ────────────────────────────────────────────────────────
 
     def _serve_table(self, table: str, qs: dict):
-        """Serve flows/dns/http event history as JSON."""
         days  = self._qs_int(qs, "days",  RETAIN_DAYS, 1, RETAIN_DAYS)
-        limit = self._qs_int(qs, "limit", 5000,         1, 20000)
-        fetch = {
-            "flows": self.db.fetch_flows,
-            "dns":   self.db.fetch_dns,
-            "http":  self.db.fetch_http,
-        }.get(table)
+        limit = self._qs_int(qs, "limit", 5000,        1, 20000)
+        fetch = {"flows": self.db.fetch_flows,
+                 "dns":   self.db.fetch_dns,
+                 "http":  self.db.fetch_http}.get(table)
         if fetch is None:
-            self.send_error(404); return
-        body = json.dumps(fetch(days=days, limit=limit)).encode()
-        self.send_response(200)
-        self.send_header("Content-Type",   "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control",  "no-cache")
-        self.end_headers()
-        self.wfile.write(body)
+            self.send_error(404)
+            return
+        self._send_json_body(fetch(days=days, limit=limit))
 
     def _serve_alerts(self, qs: dict):
         days  = self._qs_int(qs, "days",  RETAIN_DAYS, 1, RETAIN_DAYS)
-        limit = self._qs_int(qs, "limit", 5000,         1, 20000)
-        body  = json.dumps(self.db.fetch_recent(days=days, limit=limit)).encode()
-        self.send_response(200)
-        self.send_header("Content-Type",  "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _webhook_create(self):
-        try:
-            n    = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(n))
-        except Exception:
-            self._json({"error": "Bad request"}, 400); return
-
-        name       = str(body.get("name", "")).strip()
-        wtype      = str(body.get("type", "generic")).strip()
-        url        = str(body.get("url", "")).strip()
-        severities = body.get("severities", ["critical", "high", "medium", "low", "info"])
-        enabled    = bool(body.get("enabled", True))
-
-        if not name or not url:
-            self._json({"error": "name and url are required"}, 400); return
-        if wtype not in ("slack", "discord", "generic"):
-            self._json({"error": "type must be slack, discord, or generic"}, 400); return
-
-        wh = self.wdb.create(name, wtype, url, severities, enabled)
-        self._json(wh, 201)
-
-    def _webhook_update(self, wid: int):
-        if not self.wdb.get(wid):
-            self._json({"error": "Not found"}, 404); return
-        try:
-            n    = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(n))
-        except Exception:
-            self._json({"error": "Bad request"}, 400); return
-        wh = self.wdb.update(wid, **body)
-        self._json(wh)
-
-    def _webhook_test(self, wid: int):
-        wh = self.wdb.get(wid)
-        if not wh:
-            self._json({"error": "Not found"}, 404); return
-
-        from webhooks import build_payload, deliver
-        test_alert = {
-            "id":       "test-0",
-            "ts":       "2026-01-01T00:00:00+0000",
-            "src_ip":   "10.0.0.1",
-            "src_port": 12345,
-            "dst_ip":   "8.8.8.8",
-            "dst_port": 443,
-            "proto":    "TCP",
-            "iface":    "eth0",
-            "flow_id":  0,
-            "sig_id":   9999999,
-            "sig_msg":  "Watcher Test Alert — webhook is working",
-            "category": "Test",
-            "severity": "medium",
-            "action":   "allowed",
-        }
-        payload = build_payload(wh["type"], test_alert)
-        error   = deliver(wh["url"], payload)
-        if error:
-            self._json({"ok": False, "error": error})
-        else:
-            self._json({"ok": True})
+        limit = self._qs_int(qs, "limit", 5000,        1, 20000)
+        self._send_json_body(self.db.fetch_recent(days=days, limit=limit))
 
     def _serve_charts(self, qs: dict):
-        """Return all chart data in a single JSON response."""
-        days = self._qs_int(qs, "days", 1, 1, 90)
-        trend_window = self._qs_int(qs, "trend", 24, 24, 2160)  # hours: 24h–90d (2160h)
-        data = {
+        days         = self._qs_int(qs, "days",  1,  1,  90)
+        trend_window = self._qs_int(qs, "trend", 24, 24, 2160)
+        self._send_json_body({
             "top_talkers":  self.db.chart_top_talkers(limit=10, days=days),
             "trend":        (self.db.chart_alert_trend(hours=trend_window)
                              if trend_window <= 24
@@ -484,14 +401,57 @@ class Handler(BaseHTTPRequestHandler):
             "by_severity":  self.db.chart_by_severity(days=days),
             "window_hours": trend_window,
             "window_days":  days,
+        })
+
+    # ── Webhooks ──────────────────────────────────────────────────────────────
+
+    def _webhook_create(self):
+        if not self._require_role("admin"): return
+        try:
+            n    = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(n))
+        except Exception:
+            self._json({"error": "Bad request"}, 400); return
+        name       = str(body.get("name", "")).strip()
+        wtype      = str(body.get("type", "generic")).strip()
+        url        = str(body.get("url", "")).strip()
+        severities = body.get("severities", ["critical", "high", "medium", "low", "info"])
+        enabled    = bool(body.get("enabled", True))
+        if not name or not url:
+            self._json({"error": "name and url are required"}, 400); return
+        if wtype not in ("slack", "discord", "generic"):
+            self._json({"error": "type must be slack, discord, or generic"}, 400); return
+        self._json(self.wdb.create(name, wtype, url, severities, enabled), 201)
+
+    def _webhook_update(self, wid: int):
+        if not self._require_role("admin"): return
+        if not self.wdb.get(wid):
+            self._json({"error": "Not found"}, 404); return
+        try:
+            n    = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(n))
+        except Exception:
+            self._json({"error": "Bad request"}, 400); return
+        self._json(self.wdb.update(wid, **body))
+
+    def _webhook_test(self, wid: int):
+        if not self._require_role("admin"): return
+        wh = self.wdb.get(wid)
+        if not wh:
+            self._json({"error": "Not found"}, 404); return
+        from webhooks import build_payload, deliver
+        test_alert = {
+            "id": "test-0", "ts": "2026-01-01T00:00:00+0000",
+            "src_ip": "10.0.0.1", "src_port": 12345,
+            "dst_ip": "8.8.8.8",  "dst_port": 443,
+            "proto": "TCP", "iface": "eth0", "flow_id": 0,
+            "sig_id": 9999999, "sig_msg": "Watcher Test Alert — webhook is working",
+            "category": "Test", "severity": "medium", "action": "allowed",
         }
-        body = json.dumps(data).encode()
-        self.send_response(200)
-        self.send_header("Content-Type",   "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control",  "no-cache")
-        self.end_headers()
-        self.wfile.write(body)
+        error = deliver(wh["url"], build_payload(wh["type"], test_alert))
+        self._json({"ok": error is None, **({"error": error} if error else {})})
+
+    # ── Users ─────────────────────────────────────────────────────────────────
 
     def _user_create(self):
         if not self._require_role("admin"): return
@@ -522,12 +482,10 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n))
         except Exception:
             self._json({"error": "Bad request"}, 400); return
-        # Password change is a separate field
         if "password" in body:
             pw = str(body.pop("password", "")).strip()
             if pw:
                 self.um.set_password(uid, pw)
-        # Guard: can't demote the last admin
         if body.get("role") and body["role"] != "admin":
             if user["role"] == "admin" and self.um.count_admins() <= 1:
                 self._json({"error": "Cannot demote the last admin"}, 400); return
@@ -536,7 +494,7 @@ class Handler(BaseHTTPRequestHandler):
                 if self.um.count_admins() <= 1:
                     self._json({"error": "Cannot disable the last admin"}, 400); return
         updated = self.um.update(uid, **{k: v for k, v in body.items()
-                                          if k in ("role", "enabled", "username")})
+                                         if k in ("role", "enabled", "username")})
         self._json(updated)
 
     def _user_delete(self, uid: int):
@@ -546,15 +504,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "Not found"}, 404); return
         if user["role"] == "admin" and self.um.count_admins() <= 1:
             self._json({"error": "Cannot delete the last admin"}, 400); return
-        # Don't let admin delete their own account
         s = self._session()
         if s and s["username"].lower() == user["username"].lower():
             self._json({"error": "Cannot delete your own account"}, 400); return
         self.um.delete(uid)
         self._json({"deleted": uid})
 
+    # ── Acknowledgement ───────────────────────────────────────────────────────
+
     def _bulk_ack_alerts(self):
-        """POST /alerts/bulk-ack — acknowledge multiple alerts at once."""
         if self._role() == "viewer":
             self._json({"error": "Forbidden"}, 403); return
         try:
@@ -573,8 +531,6 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True, "updated": updated})
 
     def _ack_alert(self, alert_id: str):
-        """POST /alerts/<id>/ack — set status and optional note."""
-        # Viewer cannot acknowledge
         if self._role() == "viewer":
             self._json({"error": "Forbidden"}, 403); return
         try:
@@ -582,9 +538,9 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n)) if n else {}
         except Exception:
             self._json({"error": "Bad request"}, 400); return
-        status = str(body.get("status", "")).strip()
-        note   = str(body.get("note",   "")).strip()
-        s      = self._session()
+        status   = str(body.get("status", "")).strip()
+        note     = str(body.get("note",   "")).strip()
+        s        = self._session()
         username = s["username"] if s else ""
         ok = self.db.acknowledge(alert_id, status, note, username)
         if ok:
@@ -593,8 +549,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"error": "Alert not found or invalid status"}, 404)
 
+    # ── SSE ───────────────────────────────────────────────────────────────────
+
     def _serve_sse(self):
-        """Long-lived SSE response — blocks until client disconnects."""
         self.send_response(200)
         self.send_header("Content-Type",      "text/event-stream")
         self.send_header("Cache-Control",     "no-cache")
@@ -604,7 +561,6 @@ class Handler(BaseHTTPRequestHandler):
 
         cid, q = self.registry.add()
 
-        # Immediate ping so the browser confirms the connection is alive
         try:
             self.wfile.write(
                 f"event: ping\ndata: {int(time.time())}\n\n".encode()
@@ -614,7 +570,6 @@ class Handler(BaseHTTPRequestHandler):
             self.registry.remove(cid)
             return
 
-        # Drain queue, sending alerts and keep-alive pings
         while True:
             try:
                 msg = q.get(timeout=PING_EVERY)

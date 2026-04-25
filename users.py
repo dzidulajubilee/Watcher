@@ -7,21 +7,19 @@ Roles:
   analyst — read access: all views, no clear/delete, no webhooks/settings
   viewer  — stream only: alerts view only, no detail panel, no controls
 
-Password storage: same PBKDF2-SHA256 as AuthManager (260k rounds).
+Password storage: PBKDF2-SHA256 via shared password_utils module.
 """
 
-import hashlib
-import hmac
 import logging
 import secrets
 import time
 
-from config import PBKDF2_ITERS
+from password_utils import hash_password, verify_password
 
 log = logging.getLogger("watcher.users")
 
-ROLES       = ("admin", "analyst", "viewer")
-ROLE_ADMIN  = "admin"
+ROLES        = ("admin", "analyst", "viewer")
+ROLE_ADMIN   = "admin"
 ROLE_ANALYST = "analyst"
 ROLE_VIEWER  = "viewer"
 
@@ -53,34 +51,13 @@ class UserManager:
                 last_login REAL
             )
         """)
-        # Also add role + username columns to sessions table if not present
-        # (ALTER TABLE IF NOT EXISTS column is not supported in older SQLite,
-        #  so we check first)
+        # Add role + username columns to sessions table if absent
         cols = {r[1] for r in c.execute("PRAGMA table_info(sessions)").fetchall()}
         if "username" not in cols:
             c.execute("ALTER TABLE sessions ADD COLUMN username TEXT DEFAULT ''")
         if "role" not in cols:
             c.execute("ALTER TABLE sessions ADD COLUMN role TEXT DEFAULT 'admin'")
         c.commit()
-
-    # ── Password helpers (identical algorithm to AuthManager) ─────────────────
-
-    def _hash(self, password: str) -> str:
-        salt = secrets.token_hex(16)
-        h    = hashlib.pbkdf2_hmac(
-            "sha256", password.encode(), salt.encode(), PBKDF2_ITERS
-        )
-        return f"{salt}${h.hex()}"
-
-    def _verify(self, password: str, stored: str) -> bool:
-        try:
-            salt, h = stored.split("$", 1)
-            check   = hashlib.pbkdf2_hmac(
-                "sha256", password.encode(), salt.encode(), PBKDF2_ITERS
-            )
-            return hmac.compare_digest(check.hex(), h)
-        except Exception:
-            return False
 
     # ── CRUD ──────────────────────────────────────────────────────────────────
 
@@ -100,7 +77,7 @@ class UserManager:
             c.execute(
                 """INSERT INTO users (username, pw_hash, role, enabled, created_at)
                    VALUES (?, ?, ?, 1, ?)""",
-                (username, self._hash(password), role, time.time()),
+                (username, hash_password(password), role, time.time()),
             )
             c.commit()
             return self.get_by_username(username)
@@ -144,22 +121,25 @@ class UserManager:
             updates["enabled"] = 1 if updates["enabled"] else 0
         cols = ", ".join(f"{k} = ?" for k in updates)
         vals = list(updates.values()) + [uid]
-        self._conn().execute(f"UPDATE users SET {cols} WHERE id = ?", vals)
-        self._conn().commit()
+        c = self._conn()
+        c.execute(f"UPDATE users SET {cols} WHERE id = ?", vals)
+        c.commit()
         return self.get_by_id(uid)
 
     def set_password(self, uid: int, new_password: str):
         """Reset a user's password."""
-        self._conn().execute(
+        c = self._conn()
+        c.execute(
             "UPDATE users SET pw_hash = ? WHERE id = ?",
-            (self._hash(new_password), uid),
+            (hash_password(new_password), uid),
         )
-        self._conn().commit()
+        c.commit()
         log.info("Password reset for user id=%d", uid)
 
     def delete(self, uid: int):
-        self._conn().execute("DELETE FROM users WHERE id = ?", (uid,))
-        self._conn().commit()
+        c = self._conn()
+        c.execute("DELETE FROM users WHERE id = ?", (uid,))
+        c.commit()
 
     def count(self) -> int:
         return self._conn().execute(
@@ -176,8 +156,7 @@ class UserManager:
     def authenticate(self, username: str, password: str) -> dict | None:
         """
         Verify username + password.
-        Returns the user dict on success (with pw_hash included for
-        internal use), or None on failure.
+        Returns the user dict on success or None on failure.
         """
         row = self._conn().execute(
             "SELECT id, username, pw_hash, role, enabled, created_at, last_login "
@@ -189,14 +168,15 @@ class UserManager:
         d = dict(row)
         if not d["enabled"]:
             return None
-        if not self._verify(password, d["pw_hash"]):
+        if not verify_password(password, d["pw_hash"]):
             return None
         # Update last_login
-        self._conn().execute(
+        c = self._conn()
+        c.execute(
             "UPDATE users SET last_login = ? WHERE id = ?",
             (time.time(), d["id"]),
         )
-        self._conn().commit()
+        c.commit()
         d.pop("pw_hash")
         return d
 
@@ -205,15 +185,11 @@ class UserManager:
     def bootstrap_admin(self, existing_pw_hash: str) -> tuple[str, str] | None:
         """
         Called on first run if no users exist.
-        Creates an 'admin' account with username 'admin' and the same
-        password that was already set via --password / single-password auth.
-        Returns (username, raw_password) so it can be logged once,
-        or None if users already exist.
+        Creates an 'admin' account. Returns (username, raw_password) so it
+        can be logged once, or None if users already exist.
         """
         if self.count() > 0:
             return None
-        # We can't recover the plaintext from the existing hash.
-        # Generate a new strong password for the admin account.
         pw       = secrets.token_urlsafe(14)
         username = "admin"
         self.create(username, pw, role=ROLE_ADMIN)
