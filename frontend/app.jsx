@@ -1202,8 +1202,7 @@ function ChartsView() {
 
   function switchTrend(h) {
     setTrend(h);
-    // days window: 24h trend → last 1 day; 7d trend → last 7 days
-    const d = h <= 24 ? 1 : 7;
+    const d = Math.max(1, h / 24);  // 24h→1, 168h→7, 720h→30, 1440h→60, 2160h→90
     setDays(d);
     load(h, d);
   }
@@ -1236,11 +1235,19 @@ function ChartsView() {
     </div>
   );
 
+  const TREND_OPTIONS = [
+    {label:'24h', val:24},
+    {label:'7d',  val:168},
+    {label:'30d', val:720},
+    {label:'60d', val:1440},
+    {label:'90d', val:2160},
+  ];
+
   const TrendToggle = () => (
     <div style={{display:'flex',gap:1,background:'var(--bg2)',
                  border:'1px solid var(--border)',borderRadius:'var(--radius-sm)',
                  padding:2}}>
-      {[{label:'24h',val:24},{label:'7d',val:168}].map(({label,val}) => (
+      {TREND_OPTIONS.map(({label,val}) => (
         <button key={val}
           onClick={() => switchTrend(val)}
           style={{
@@ -1254,7 +1261,8 @@ function ChartsView() {
     </div>
   );
 
-  const window_label = trend <= 24 ? 'Last 24 hours' : 'Last 7 days';
+  const opt = TREND_OPTIONS.find(o => o.val === trend);
+  const window_label = opt ? 'Last ' + opt.label : 'Last ' + trend + 'h';
 
   return (
     <main className="main" style={{overflow:'auto'}}>
@@ -2469,14 +2477,33 @@ function App() {
             {topSrcs.map(([ip, cnt]) => {
               const maxCount = topSrcs[0][1];
               const percent = (cnt / maxCount) * 100;
+              const isActive = search === ip;
               return (
-                <div key={ip} style={{marginBottom:8}}>
-                  <div style={{display:'flex',justifyContent:'space-between',fontSize:11,marginBottom:2}}>
-                    <span className="src-ip" style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:100}}>{ip}</span>
-                    <span className="src-cnt">{cnt}</span>
+                <div key={ip}
+                  onClick={() => setSearch(isActive ? '' : ip)}
+                  title={isActive ? 'Click to clear filter' : ('Click to filter: ' + ip)}
+                  style={{
+                    marginBottom:8, cursor:'pointer',
+                    padding:'4px 6px', margin:'0 -6px 8px',
+                    borderRadius:'var(--radius-sm)',
+                    background: isActive ? 'var(--accent-d)' : 'transparent',
+                    border: isActive ? '1px solid rgba(79,156,249,.25)' : '1px solid transparent',
+                    transition:'background .12s, border-color .12s',
+                  }}>
+                  <div style={{display:'flex',justifyContent:'space-between',fontSize:11,marginBottom:3}}>
+                    <span className="src-ip" style={{
+                      overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:100,
+                      color: isActive ? 'var(--accent)' : '',
+                      fontWeight: isActive ? 500 : 'normal',
+                    }}>{ip}</span>
+                    <span className="src-cnt" style={{color: isActive ? 'var(--accent)' : ''}}>{cnt}</span>
                   </div>
                   <div style={{height:4,background:'var(--bg3)',borderRadius:2,overflow:'hidden'}}>
-                    <div style={{width:`${percent}%`,height:'100%',background:'var(--accent)',borderRadius:2}}/>
+                    <div style={{width:(percent + '%'),height:'100%',borderRadius:2,
+                      background: isActive ? 'var(--accent)' : 'var(--accent)',
+                      opacity: isActive ? 1 : 0.5,
+                      transition:'opacity .12s',
+                    }}/>
                   </div>
                 </div>
               );

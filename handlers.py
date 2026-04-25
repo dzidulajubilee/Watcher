@@ -474,7 +474,7 @@ class Handler(BaseHTTPRequestHandler):
     def _serve_charts(self, qs: dict):
         """Return all chart data in a single JSON response."""
         days = self._qs_int(qs, "days", 1, 1, 90)
-        trend_window = self._qs_int(qs, "trend", 24, 24, 168)  # hours: 24 or 168 (7d)
+        trend_window = self._qs_int(qs, "trend", 24, 24, 2160)  # hours: 24h–90d (2160h)
         data = {
             "top_talkers":  self.db.chart_top_talkers(limit=10, days=days),
             "trend":        (self.db.chart_alert_trend(hours=trend_window)
