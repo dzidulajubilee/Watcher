@@ -410,7 +410,16 @@ Sessions without a `username` are invalidated at startup so all users re-authent
 
 ### Database path change (events.db / config.db)
 
-If you are upgrading from a version that used a single `alerts.db`, pass the old path to `--db` and let `--config-db` default to a new `config.db`:
+If you are upgrading from a version that used a single `alerts.db`, You'll first need to migrate
+
+
+```bash
+python3 migrate.py --source /path/to/alerts.db --dry-run
+
+python3 migrate.py --source /path/to/alerts.db
+```
+
+Demo run available pass the old database with `-db` and let `--config-db` default to a new `config.db`:
 
 ```bash
 python3 server.py --db /path/to/alerts.db
