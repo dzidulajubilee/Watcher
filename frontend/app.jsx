@@ -770,10 +770,8 @@ function DNSView({ rows, loading, selected, onSelect, onClear }) {
           <table>
             <thead><tr>
               <th style={{width:80}}>Time</th>
-              <th style={{width:60}}>Type</th>
-              <th>Query Name</th>
-              <th style={{width:60}}>RR Type</th>
-              <th style={{width:60}}>RCode</th>
+              <th style={{width:90}}>Type</th>
+              <th style={{width:70}}>RCode</th>
               <th style={{width:105}}>Source</th>
               <th style={{width:105}}>Resolver</th>
             </tr></thead>
@@ -784,8 +782,6 @@ function DNSView({ rows, loading, selected, onSelect, onClear }) {
                     onClick={()=>onSelect(r)}>
                   <td className="mono-dim">{fmtTime(r.ts)}</td>
                   <td><span className="proto">{r.dns_type}</span></td>
-                  <td style={{fontSize:12,color:'var(--text1)',fontFamily:'var(--mono)',maxWidth:0,overflow:'hidden',textOverflow:'ellipsis'}}>{r.rrname||'—'}</td>
-                  <td className="mono-dim">{r.rrtype||'—'}</td>
                   <td className="mono-dim">{r.rcode||'—'}</td>
                   <td className="mono">{r.src_ip}</td>
                   <td className="mono">{r.dst_ip}</td>
@@ -859,9 +855,7 @@ function DNSDetail({ item }) {
       <div className="dsec">
         <div className="dsec-title">DNS Query</div>
         <div className="dgrid">
-          <F label="Name"       val={item.rrname} full/>
           <F label="Type"       val={item.dns_type}/>
-          <F label="RR Type"    val={item.rrtype}/>
           <F label="RCode"      val={item.rcode}/>
           <F label="TTL"        val={item.ttl?item.ttl+'s':'—'}/>
           <F label="Source IP"  val={item.src_ip}/>
