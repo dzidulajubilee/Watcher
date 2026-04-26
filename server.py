@@ -32,14 +32,15 @@ import threading
 from http.server import HTTPServer
 
 import config
-from auth       import AuthManager
-from users      import UserManager
-from config_db  import ConfigDB
-from database   import AlertDB
-from handlers   import Handler
-from registry   import Registry
-from tail       import purge_thread, tail_thread
-from webhooks   import WebhookDB, delivery_worker
+from auth          import AuthManager
+from users         import UserManager
+from config_db     import ConfigDB
+from database      import AlertDB
+from database_dns  import DnsDB
+from handlers      import Handler
+from registry      import Registry
+from tail          import purge_thread, tail_thread
+from webhooks      import WebhookDB, delivery_worker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,7 +67,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--host",         default=config.DEFAULT_HOST,
                    help="Bind address")
     p.add_argument("--db",           default=str(config.DEFAULT_DB),
-                   help="Path to events SQLite database (alerts, flows, dns, http)")
+                   help="Path to events SQLite database (alerts, flows, http)")
+    p.add_argument("--dns-db",       default=str(config.DEFAULT_DNS_DB),
+                   dest="dns_db",
+                   help="Path to DNS SQLite database (dns_events)")
     p.add_argument("--config-db",    default=str(config.DEFAULT_CONFIG_DB),
                    dest="config_db",
                    help="Path to config SQLite database (auth, sessions, users, webhooks)")
@@ -81,7 +85,10 @@ def main():
     args = build_arg_parser().parse_args()
 
     # ── Events DB ─────────────────────────────────────────────────────────────
-    db = AlertDB(path=args.db, retain_days=args.retain_days)
+    db     = AlertDB(path=args.db, retain_days=args.retain_days)
+
+    # ── DNS DB ────────────────────────────────────────────────────────────────
+    dns_db = DnsDB(path=args.dns_db, retain_days=args.retain_days)
 
     # ── Config DB (auth, sessions, users, webhooks) ───────────────────────────
     cfg_db = ConfigDB(path=args.config_db)
@@ -129,25 +136,28 @@ def main():
     Handler.registry = registry
     Handler.wdb      = wdb
     Handler.um       = um
+    Handler.dns_db   = dns_db
 
     # ── Log DB state ──────────────────────────────────────────────────────────
     s = db.stats()
     log.info(
-        "DB: alerts=%d  flows=%d  dns=%d  oldest: %s",
+        "Events DB: alerts=%d  flows=%d  http=%d  oldest: %s",
         s["alerts"]["total"], s["flows"]["total"],
-        s["dns"]["total"], s["oldest"] or "none",
+        s["http"]["total"], s["oldest"] or "none",
     )
+    log.info("DNS DB   : %d events", dns_db.count())
 
     # ── Background threads ────────────────────────────────────────────────────
     threading.Thread(
         target=tail_thread,
         args=(args.eve, db, registry, wdb),
+        kwargs={"dns_db": dns_db},
         daemon=True, name="tail",
     ).start()
 
     threading.Thread(
         target=purge_thread,
-        args=(db, auth),
+        args=(db, auth, dns_db),
         daemon=True, name="purge",
     ).start()
 

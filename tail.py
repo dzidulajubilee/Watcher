@@ -119,10 +119,11 @@ def _http_summary(evt: dict) -> dict:
     }
 
 
-def tail_thread(path: str, db, registry, wdb=None):
+def tail_thread(path: str, db, registry, wdb=None, dns_db=None):
     """
     Runs forever in a daemon thread.
     Tails eve.json, persists each event, and broadcasts SSE summaries.
+    dns_db: DnsDB instance — if provided, DNS events go here instead of db.
     """
     log.info("Tailing %s", path)
 
@@ -154,7 +155,10 @@ def tail_thread(path: str, db, registry, wdb=None):
                             registry.broadcast("flow", _flow_summary(parsed))
 
                         elif etype == "dns":
-                            db.insert_dns(parsed)
+                            if dns_db is not None:
+                                dns_db.insert(parsed)
+                            else:
+                                db.insert_dns(parsed)
                             registry.broadcast("dns", _dns_summary(parsed))
 
                         elif etype == "http":
@@ -176,9 +180,11 @@ def tail_thread(path: str, db, registry, wdb=None):
             time.sleep(3)
 
 
-def purge_thread(db, auth):
+def purge_thread(db, auth, dns_db=None):
     from config import PURGE_EVERY
     while True:
         time.sleep(PURGE_EVERY)
         db.purge_old()
         auth.purge_expired()
+        if dns_db is not None:
+            dns_db.purge_old()

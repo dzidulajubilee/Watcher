@@ -59,6 +59,7 @@ class Handler(BaseHTTPRequestHandler):
     registry = None
     wdb      = None
     um       = None
+    dns_db   = None   # DnsDB — dedicated DNS database
 
     server_version = ""
     sys_version    = ""
@@ -277,7 +278,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"deleted": self.db.clear_flows()})
         elif p.path == "/dns":
             if not self._require_role("admin"): return
-            self._json({"deleted": self.db.clear_dns()})
+            self._json({"deleted": self.dns_db.clear()})
         elif p.path.startswith("/users/"):
             try:
                 self._user_delete(int(p.path.split("/")[2]))
@@ -376,8 +377,10 @@ class Handler(BaseHTTPRequestHandler):
     def _serve_table(self, table: str, qs: dict):
         days  = self._qs_int(qs, "days",  RETAIN_DAYS, 1, RETAIN_DAYS)
         limit = self._qs_int(qs, "limit", 5000,        1, 20000)
+        if table == "dns":
+            self._send_json_body(self.dns_db.fetch(days=days, limit=limit))
+            return
         fetch = {"flows": self.db.fetch_flows,
-                 "dns":   self.db.fetch_dns,
                  "http":  self.db.fetch_http}.get(table)
         if fetch is None:
             self.send_error(404)
