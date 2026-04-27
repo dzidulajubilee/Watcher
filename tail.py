@@ -11,10 +11,35 @@ import time
 
 log = logging.getLogger("watcher.tail")
 
-_SEVERITY_MAP = {1: "critical", 2: "high", 3: "medium", 4: "low"}
+_SEVERITY_MAP = {
+    1: "critical",   # classtype: trojan-activity, attempted-admin, domain-c2, etc.
+    2: "high",       # classtype: bad-unknown, attempted-recon, misc-attack, etc.
+    3: "medium",     # classtype: icmp-event, network-scan, protocol-command-decode, etc.
+    4: "low",        # classtype: tcp-connection
+    5: "info",       # custom local rules (local.rules, sid:9000001+)
+}
+
+# Category overrides — these take precedence over the numeric priority map.
+# Suricata writes the classtype's short description into alert.category in eve.json.
+# Only entries that need reclassification away from their default priority are listed.
+_CATEGORY_OVERRIDE = {
+    "not suspicious traffic": "info",   # classtype:not-suspicious  (priority 3 → info)
+    "misc activity":          "low",    # classtype:misc-activity    (priority 3 → low)
+}
 
 
-def map_severity(level):
+def map_severity(level, category: str = "") -> str:
+    """
+    Resolve a Suricata numeric priority + category string to a Watcher
+    severity label.
+
+    Category overrides are checked first so that semantically weak classtypes
+    (not-suspicious, misc-activity) are not over-reported as 'medium' purely
+    because Suricata assigns them priority 3.
+    """
+    override = _CATEGORY_OVERRIDE.get(category.lower().strip())
+    if override:
+        return override
     return _SEVERITY_MAP.get(level, "info")
 
 
@@ -50,7 +75,7 @@ def parse_eve_line(raw: str):
             "sig_id":   a.get("signature_id", 0),
             "sig_msg":  a.get("signature", ""),
             "category": a.get("category", ""),
-            "severity": map_severity(a.get("severity")),
+            "severity": map_severity(a.get("severity"), a.get("category", "")),
             "action":   a.get("action", "allowed"),
             "raw":      evt,
         }

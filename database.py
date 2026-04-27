@@ -341,6 +341,34 @@ class AlertDB:
         log.info("Alerts cleared — %d rows deleted.", cur.rowcount)
         return cur.rowcount
 
+    def delete_by_ids(self, ids: list) -> int:
+        """
+        Permanently delete a specific set of alerts by their IDs.
+        Also removes any associated ack_history rows.
+        Returns the number of alerts deleted.
+
+        Capped at 500 IDs per call — SQLite's default SQLITE_MAX_VARIABLE_NUMBER
+        is 999, and staying well below it prevents OperationalError at the DB layer
+        regardless of what the caller passes.
+        """
+        if not ids:
+            return 0
+        # Coerce to strings and enforce cap — defence-in-depth even if the
+        # handler has already validated; the DB layer should never trust callers.
+        ids = [str(i) for i in ids[:500]]
+        placeholders = ",".join(["?"] * len(ids))
+        c   = self._conn()
+        # Remove ack history first (no FK cascade in SQLite by default)
+        c.execute(
+            f"DELETE FROM ack_history WHERE alert_id IN ({placeholders})", ids
+        )
+        cur = c.execute(
+            f"DELETE FROM alerts WHERE id IN ({placeholders})", ids
+        )
+        c.commit()
+        log.info("Deleted %d selected alerts.", cur.rowcount)
+        return cur.rowcount
+
     def clear_flows(self) -> int:
         c   = self._conn()
         cur = c.execute("DELETE FROM flows")

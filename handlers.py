@@ -237,6 +237,8 @@ class Handler(BaseHTTPRequestHandler):
             self._user_create()
         elif p.path == "/alerts/bulk-ack":
             self._bulk_ack_alerts()
+        elif p.path == "/alerts/delete-selected":
+            self._delete_selected_alerts()
         elif re.match(r"^/alerts/[^/]+/ack$", p.path):
             self._ack_alert(p.path.split("/")[2])
         elif p.path == "/webhooks":
@@ -551,6 +553,28 @@ class Handler(BaseHTTPRequestHandler):
                         "status": status, "note": note, "by": username})
         else:
             self._json({"error": "Alert not found or invalid status"}, 404)
+
+    def _delete_selected_alerts(self):
+        """Permanently delete a specific list of alerts. Admin only."""
+        if not self._require_role("admin"): return
+        try:
+            n    = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(n)) if n else {}
+        except Exception:
+            self._json({"error": "Bad request"}, 400); return
+        ids = body.get("ids", [])
+        if not ids or not isinstance(ids, list):
+            self._json({"error": "ids must be a non-empty list"}, 400); return
+        # Cap to 500 — SQLite's SQLITE_MAX_VARIABLE_NUMBER is 999 by default.
+        # The frontend renders at most 300 rows so this is never hit in practice,
+        # but the API must be hardened independently of the UI.
+        if len(ids) > 500:
+            self._json({"error": "Too many IDs — maximum 500 per request"}, 400); return
+        # Ensure every element is a plain string — reject if any element is not.
+        if not all(isinstance(i, str) for i in ids):
+            self._json({"error": "All IDs must be strings"}, 400); return
+        deleted = self.db.delete_by_ids(ids)
+        self._json({"ok": True, "deleted": deleted})
 
     # ── SSE ───────────────────────────────────────────────────────────────────
 

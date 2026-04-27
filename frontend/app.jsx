@@ -2042,6 +2042,8 @@ function App() {
   const [historyCount, setHistoryCount] = useState(0);
   const [showConfirm,  setShowConfirm]  = useState(false);
   const [clearing,     setClearing]     = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleting,     setDeleting]     = useState(false);
   const [theme,        setTheme]        = useState(
     () => localStorage.getItem('watcher-theme') || 'night'
   );
@@ -2272,6 +2274,23 @@ function App() {
     setHistoryCount(0);
     setClearing(false);
     setShowConfirm(false);
+  }
+
+  async function handleDeleteSelected() {
+    setDeleting(true);
+    const ids = [...selectedIds];
+    try {
+      await fetch('/alerts/delete-selected', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ ids }),
+      });
+      setAlerts(prev => prev.filter(a => !selectedIds.has(a.id)));
+      if (selected && selectedIds.has(selected.id)) setSelected(null);
+      setSelectedIds(new Set());
+    } catch {}
+    setDeleting(false);
+    setShowDeleteConfirm(false);
   }
 
   const handleClearFlows = async () => {
@@ -2638,6 +2657,14 @@ function App() {
                     color:'white', fontSize:11, fontFamily:'var(--sans)',
                     cursor: bulkSaving ? 'wait' : 'pointer', whiteSpace:'nowrap',
                   }}>{bulkSaving ? 'Saving…' : 'Apply to all'}</button>
+                  {role === 'admin' && (
+                    <button onClick={() => setShowDeleteConfirm(true)} style={{
+                      padding:'3px 12px', borderRadius:'var(--radius-sm)',
+                      border:'1px solid var(--red)', background:'var(--red-d)',
+                      color:'var(--red)', fontSize:11, fontFamily:'var(--sans)',
+                      cursor:'pointer', whiteSpace:'nowrap',
+                    }}>Delete</button>
+                  )}
                   <button onClick={() => setSelectedIds(new Set())} style={{
                     padding:'3px 9px', borderRadius:'var(--radius-sm)',
                     border:'1px solid var(--border2)', background:'transparent',
@@ -2781,6 +2808,49 @@ function App() {
           setWhLoading={setWhLoading}
           onRefreshWebhooks={fetchWebhooks}
         />
+      )}
+
+      {/* Confirm delete selected alerts modal */}
+      {showDeleteConfirm && (
+        <div className="modal-bg" onClick={() => setShowDeleteConfirm(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 10 }}>
+              Delete {selectedIds.size} selected alert{selectedIds.size !== 1 ? 's' : ''}?
+            </div>
+            <div style={{
+              fontSize: 12, color: 'var(--text2)',
+              lineHeight: 1.7, marginBottom: 24,
+            }}>
+              This will permanently remove{' '}
+              <b style={{ color: 'var(--text1)' }}>
+                {selectedIds.size} alert{selectedIds.size !== 1 ? 's' : ''}
+              </b>{' '}
+              and their acknowledgement history. This action cannot be undone.
+            </div>
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button className="btn"
+                      onClick={() => setShowDeleteConfirm(false)}
+                      disabled={deleting}
+                      style={{ minWidth: 80 }}>
+                Cancel
+              </button>
+              <button onClick={handleDeleteSelected}
+                      disabled={deleting}
+                      style={{
+                        minWidth: 80, padding: '4px 14px',
+                        borderRadius: 'var(--radius-sm)',
+                        border: '1px solid var(--red)',
+                        background: 'var(--red-d)',
+                        color: 'var(--red)', fontSize: 11,
+                        fontFamily: 'var(--sans)',
+                        cursor: deleting ? 'wait' : 'pointer',
+                        transition: 'all .15s',
+                      }}>
+                {deleting ? 'Deleting…' : `Yes, delete ${selectedIds.size}`}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Confirm clear alerts modal */}
