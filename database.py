@@ -1,10 +1,10 @@
 """
 Watcher IDS Dashboard — Database (Events)
-Thread-safe SQLite wrapper for high-volume event tables:
-  alerts, flows, dns_events, http_events, ack_history.
+Thread-safe SQLite wrapper for alert/flow/http event tables:
+  alerts, flows, http_events, ack_history.
 
-Kept separate from config.db so heavy write traffic never contends with
-auth/session lookups. See config_db.py for the config-side connection.
+DNS events have been moved to DnsDB (database_dns.py) due to their
+substantially higher write volume. See config_db.py for config tables.
 """
 
 import json
@@ -82,14 +82,6 @@ class AlertDB:
                 bytes_toserver INTEGER DEFAULT 0, bytes_toclient INTEGER DEFAULT 0,
                 duration_s REAL DEFAULT 0, state TEXT, reason TEXT, alerted INTEGER DEFAULT 0)""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_f_ts ON flows (ts_epoch)")
-
-            c.execute("""CREATE TABLE IF NOT EXISTS dns_events (
-                id TEXT PRIMARY KEY, ts TEXT NOT NULL, ts_epoch REAL NOT NULL,
-                src_ip TEXT, src_port INTEGER, dst_ip TEXT, dst_port INTEGER,
-                iface TEXT, flow_id INTEGER, tx_id INTEGER, dns_type TEXT,
-                rrname TEXT, rrtype TEXT, rcode TEXT, ttl INTEGER, answers TEXT)""")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_d_ts     ON dns_events (ts_epoch)")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_d_rrname ON dns_events (rrname)")
 
             c.execute("""CREATE TABLE IF NOT EXISTS http_events (
                 id TEXT PRIMARY KEY, ts TEXT NOT NULL, ts_epoch REAL NOT NULL,
@@ -204,48 +196,6 @@ class AlertDB:
                FROM flows WHERE ts_epoch>=? ORDER BY ts_epoch DESC LIMIT ?""",
             (cutoff, limit)).fetchall()
         return [dict(r) for r in rows]
-
-    # ── DNS ───────────────────────────────────────────────────────────────────
-
-    def insert_dns(self, evt: dict):
-        d    = evt.get("dns", {})
-        ts   = evt.get("timestamp", "")
-        uid  = f"{evt.get('flow_id',0)}-{d.get('tx_id',0)}-{d.get('type','')}"
-        answers_json = json.dumps(d.get("answers", d.get("grouped", {})) or [])
-        try:
-            c = self._conn()
-            c.execute(
-                """INSERT OR IGNORE INTO dns_events
-                   (id,ts,ts_epoch,src_ip,src_port,dst_ip,dst_port,
-                    iface,flow_id,tx_id,dns_type,rrname,rrtype,rcode,ttl,answers)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (uid, ts, self._to_epoch(ts),
-                 evt.get("src_ip", ""), evt.get("src_port", 0),
-                 evt.get("dest_ip", ""), evt.get("dest_port", 0),
-                 evt.get("in_iface", ""), evt.get("flow_id", 0),
-                 d.get("tx_id", 0), d.get("type", ""),
-                 d.get("rrname", ""), d.get("rrtype", ""),
-                 d.get("rcode", ""), d.get("ttl", 0), answers_json))
-            c.commit()
-        except sqlite3.Error as e:
-            log.warning("DB insert (dns): %s", e)
-
-    def fetch_dns(self, days=None, limit=5000):
-        cutoff = time.time() - (days or self.retain_days) * 86400
-        rows = self._conn().execute(
-            """SELECT id,ts,src_ip,src_port,dst_ip,dst_port,
-                      flow_id,tx_id,dns_type,rrname,rrtype,rcode,ttl,answers
-               FROM dns_events WHERE ts_epoch>=? ORDER BY ts_epoch DESC LIMIT ?""",
-            (cutoff, limit)).fetchall()
-        result = []
-        for row in rows:
-            d = dict(row)
-            try:
-                d["answers"] = json.loads(d.get("answers") or "[]")
-            except Exception:
-                d["answers"] = []
-            result.append(d)
-        return result
 
     # ── HTTP ──────────────────────────────────────────────────────────────────
 
@@ -367,10 +317,10 @@ class AlertDB:
 
     # ── Maintenance ───────────────────────────────────────────────────────────
 
-    _PURGEABLE_TABLES = ("alerts", "flows", "dns_events", "http_events")
+    _PURGEABLE_TABLES = ("alerts", "flows", "http_events")
     _PURGE_SQL = {
         t: f"DELETE FROM {t} WHERE ts_epoch<?"
-        for t in ("alerts", "flows", "dns_events", "http_events")
+        for t in ("alerts", "flows", "http_events")
     }
 
     def purge_old(self):
@@ -391,18 +341,39 @@ class AlertDB:
         log.info("Alerts cleared — %d rows deleted.", cur.rowcount)
         return cur.rowcount
 
+    def delete_by_ids(self, ids: list) -> int:
+        """
+        Permanently delete a specific set of alerts by their IDs.
+        Also removes any associated ack_history rows.
+        Returns the number of alerts deleted.
+
+        Capped at 500 IDs per call — SQLite's default SQLITE_MAX_VARIABLE_NUMBER
+        is 999, and staying well below it prevents OperationalError at the DB layer
+        regardless of what the caller passes.
+        """
+        if not ids:
+            return 0
+        # Coerce to strings and enforce cap — defence-in-depth even if the
+        # handler has already validated; the DB layer should never trust callers.
+        ids = [str(i) for i in ids[:500]]
+        placeholders = ",".join(["?"] * len(ids))
+        c   = self._conn()
+        # Remove ack history first (no FK cascade in SQLite by default)
+        c.execute(
+            f"DELETE FROM ack_history WHERE alert_id IN ({placeholders})", ids
+        )
+        cur = c.execute(
+            f"DELETE FROM alerts WHERE id IN ({placeholders})", ids
+        )
+        c.commit()
+        log.info("Deleted %d selected alerts.", cur.rowcount)
+        return cur.rowcount
+
     def clear_flows(self) -> int:
         c   = self._conn()
         cur = c.execute("DELETE FROM flows")
         c.commit()
         log.info("Flows cleared — %d rows deleted.", cur.rowcount)
-        return cur.rowcount
-
-    def clear_dns(self) -> int:
-        c   = self._conn()
-        cur = c.execute("DELETE FROM dns_events")
-        c.commit()
-        log.info("DNS events cleared — %d rows deleted.", cur.rowcount)
         return cur.rowcount
 
     # ── Chart data ────────────────────────────────────────────────────────────
@@ -480,11 +451,11 @@ class AlertDB:
 
     _COUNT_SQL = {
         t: f"SELECT COUNT(*) FROM {t}"
-        for t in ("alerts", "flows", "dns_events", "http_events")
+        for t in ("alerts", "flows", "http_events")
     }
     _RECENT_SQL = {
         t: f"SELECT COUNT(*) FROM {t} WHERE ts_epoch>=?"
-        for t in ("alerts", "flows", "dns_events", "http_events")
+        for t in ("alerts", "flows", "http_events")
     }
 
     def stats(self) -> dict:
@@ -496,9 +467,8 @@ class AlertDB:
 
         oldest = c.execute("SELECT MIN(ts) FROM alerts").fetchone()[0]
         return {
-            "alerts": {"total": _cnt("alerts"),      "recent": _recent("alerts")},
-            "flows":  {"total": _cnt("flows"),        "recent": _recent("flows")},
-            "dns":    {"total": _cnt("dns_events"),   "recent": _recent("dns_events")},
-            "http":   {"total": _cnt("http_events"),  "recent": _recent("http_events")},
+            "alerts": {"total": _cnt("alerts"),     "recent": _recent("alerts")},
+            "flows":  {"total": _cnt("flows"),       "recent": _recent("flows")},
+            "http":   {"total": _cnt("http_events"), "recent": _recent("http_events")},
             "oldest": oldest,
         }

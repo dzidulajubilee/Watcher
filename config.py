@@ -11,9 +11,11 @@ DEFAULT_PORT  = 8765
 DEFAULT_HOST  = "0.0.0.0"
 
 # ── Databases ─────────────────────────────────────────────────────────────────
-# events.db  — high-volume: alerts, flows, dns_events, http_events, ack_history
+# events.db  — high-volume: alerts, flows, http_events, ack_history
+# dns.db     — very high-volume: dns_events (separated due to query frequency)
 # config.db  — low-write:   auth, sessions, users, webhooks
 DEFAULT_DB        = Path(__file__).parent / "events.db"
+DEFAULT_DNS_DB    = Path(__file__).parent / "dns.db"
 DEFAULT_CONFIG_DB = Path(__file__).parent / "config.db"
 
 # ── Data retention ────────────────────────────────────────────────────────────

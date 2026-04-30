@@ -59,6 +59,7 @@ class Handler(BaseHTTPRequestHandler):
     registry = None
     wdb      = None
     um       = None
+    dns_db   = None   # DnsDB — dedicated DNS database
 
     server_version = ""
     sys_version    = ""
@@ -236,6 +237,8 @@ class Handler(BaseHTTPRequestHandler):
             self._user_create()
         elif p.path == "/alerts/bulk-ack":
             self._bulk_ack_alerts()
+        elif p.path == "/alerts/delete-selected":
+            self._delete_selected_alerts()
         elif re.match(r"^/alerts/[^/]+/ack$", p.path):
             self._ack_alert(p.path.split("/")[2])
         elif p.path == "/webhooks":
@@ -277,7 +280,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"deleted": self.db.clear_flows()})
         elif p.path == "/dns":
             if not self._require_role("admin"): return
-            self._json({"deleted": self.db.clear_dns()})
+            self._json({"deleted": self.dns_db.clear()})
         elif p.path.startswith("/users/"):
             try:
                 self._user_delete(int(p.path.split("/")[2]))
@@ -376,8 +379,10 @@ class Handler(BaseHTTPRequestHandler):
     def _serve_table(self, table: str, qs: dict):
         days  = self._qs_int(qs, "days",  RETAIN_DAYS, 1, RETAIN_DAYS)
         limit = self._qs_int(qs, "limit", 5000,        1, 20000)
+        if table == "dns":
+            self._send_json_body(self.dns_db.fetch(days=days, limit=limit))
+            return
         fetch = {"flows": self.db.fetch_flows,
-                 "dns":   self.db.fetch_dns,
                  "http":  self.db.fetch_http}.get(table)
         if fetch is None:
             self.send_error(404)
@@ -548,6 +553,28 @@ class Handler(BaseHTTPRequestHandler):
                         "status": status, "note": note, "by": username})
         else:
             self._json({"error": "Alert not found or invalid status"}, 404)
+
+    def _delete_selected_alerts(self):
+        """Permanently delete a specific list of alerts. Admin only."""
+        if not self._require_role("admin"): return
+        try:
+            n    = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(n)) if n else {}
+        except Exception:
+            self._json({"error": "Bad request"}, 400); return
+        ids = body.get("ids", [])
+        if not ids or not isinstance(ids, list):
+            self._json({"error": "ids must be a non-empty list"}, 400); return
+        # Cap to 500 — SQLite's SQLITE_MAX_VARIABLE_NUMBER is 999 by default.
+        # The frontend renders at most 300 rows so this is never hit in practice,
+        # but the API must be hardened independently of the UI.
+        if len(ids) > 500:
+            self._json({"error": "Too many IDs — maximum 500 per request"}, 400); return
+        # Ensure every element is a plain string — reject if any element is not.
+        if not all(isinstance(i, str) for i in ids):
+            self._json({"error": "All IDs must be strings"}, 400); return
+        deleted = self.db.delete_by_ids(ids)
+        self._json({"ok": True, "deleted": deleted})
 
     # ── SSE ───────────────────────────────────────────────────────────────────
 

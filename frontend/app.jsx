@@ -94,7 +94,7 @@ function ThemePicker({ theme, onChange }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // ── Main App ──
 
-const { useState, useEffect, useRef } = React;
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const MAX_ALERTS = 5000;
@@ -109,27 +109,30 @@ const SEV_COLORS = {
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+// today/yesterday epoch boundaries are cached and refreshed once per minute
+// so the 4-Date-object per-call overhead is gone from the hot render path.
+let _fmtCache = { todayStart: 0, yestStart: 0, ts: 0 };
+function _refreshFmtCache() {
+  const now   = new Date();
+  now.setHours(0, 0, 0, 0);
+  _fmtCache = {
+    todayStart: now.getTime(),
+    yestStart:  now.getTime() - 86400000,
+    ts:         Date.now(),
+  };
+}
+_refreshFmtCache();
+
 function fmtTime(ts) {
   try {
-    const d     = new Date(ts);
-    const now   = new Date();
-    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const yesterday = new Date(today - 86400000);
-    const dDay  = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-
+    if (Date.now() - _fmtCache.ts > 60000) _refreshFmtCache();
+    const d = new Date(ts);
+    const dStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
     const timeStr = d.toLocaleTimeString('en-US', {
       hour: '2-digit', minute: '2-digit', hour12: true,
     });
-
-    if (dDay.getTime() === today.getTime()) {
-      // Today — just show time e.g. "03:21 PM"
-      return timeStr;
-    }
-    if (dDay.getTime() === yesterday.getTime()) {
-      // Yesterday — e.g. "Yesterday at 03:21 PM"
-      return `Yesterday at ${timeStr}`;
-    }
-    // Older — date + time e.g. "Apr 13 at 03:21 PM"
+    if (dStart === _fmtCache.todayStart) return timeStr;
+    if (dStart === _fmtCache.yestStart)  return `Yesterday at ${timeStr}`;
     const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
     return `${dateStr} at ${timeStr}`;
   } catch { return '--:--'; }
@@ -566,9 +569,12 @@ function FlowsView({ rows, loading, selected, onSelect, onClear }) {
   const [search, setSearch] = useState('');
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const q = search.toLowerCase();
-  const filtered = rows.filter(r =>
-    !q || r.src_ip?.includes(q) || r.dst_ip?.includes(q) ||
-    r.proto?.toLowerCase().includes(q) || r.app_proto?.toLowerCase().includes(q)
+  const filtered = useMemo(() =>
+    rows.filter(r =>
+      !q || r.src_ip?.includes(q) || r.dst_ip?.includes(q) ||
+      r.proto?.toLowerCase().includes(q) || r.app_proto?.toLowerCase().includes(q)
+    ),
+    [rows, q]
   );
 
   const handleClearClick = () => {
@@ -733,9 +739,12 @@ function DNSView({ rows, loading, selected, onSelect, onClear }) {
   const [search, setSearch] = useState('');
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const q = search.toLowerCase();
-  const filtered = rows.filter(r =>
-    !q || r.rrname?.toLowerCase().includes(q) || r.src_ip?.includes(q) ||
-    r.rrtype?.toLowerCase().includes(q) || r.rcode?.toLowerCase().includes(q)
+  const filtered = useMemo(() =>
+    rows.filter(r =>
+      !q || r.rrname?.toLowerCase().includes(q) || r.src_ip?.includes(q) ||
+      r.rrtype?.toLowerCase().includes(q) || r.rcode?.toLowerCase().includes(q)
+    ),
+    [rows, q]
   );
 
   const handleConfirmClear = () => {
@@ -855,6 +864,7 @@ function DNSDetail({ item }) {
       <div className="dsec">
         <div className="dsec-title">DNS Query</div>
         <div className="dgrid">
+          <F label="Query Name"  val={item.rrname} full/>
           <F label="Type"       val={item.dns_type}/>
           <F label="RCode"      val={item.rcode}/>
           <F label="TTL"        val={item.ttl?item.ttl+'s':'—'}/>
@@ -2032,6 +2042,8 @@ function App() {
   const [historyCount, setHistoryCount] = useState(0);
   const [showConfirm,  setShowConfirm]  = useState(false);
   const [clearing,     setClearing]     = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleting,     setDeleting]     = useState(false);
   const [theme,        setTheme]        = useState(
     () => localStorage.getItem('watcher-theme') || 'night'
   );
@@ -2063,12 +2075,12 @@ function App() {
   }, [theme]);
 
   // ── Fetch webhooks ────────────────────────────────────────────────────────────
-  const fetchWebhooks = () => {
+  const fetchWebhooks = useCallback(() => {
     fetch('/webhooks')
       .then(r => r.json())
       .then(data => { if (Array.isArray(data)) setWebhooks(data); })
       .catch(() => {});
-  };
+  }, []);
   useEffect(() => { fetchWebhooks(); }, []);
 
   // ── Fetch current user + role ─────────────────────────────────────────────
@@ -2134,8 +2146,10 @@ function App() {
           newIdsRef.current.add(evt.id);
           setTimeout(() => newIdsRef.current.delete(evt.id), 400);
           setAlerts(prev => {
+            if (prev.length > 0 && prev[0].id === evt.id) return prev; // duplicate guard (fast path)
             if (prev.some(x => x.id === evt.id)) return prev;
-            return [evt, ...prev].slice(0, MAX_ALERTS);
+            const next = [evt, ...prev];
+            return next.length > MAX_ALERTS ? next.slice(0, MAX_ALERTS) : next;
           });
         } catch {}
       });
@@ -2145,8 +2159,10 @@ function App() {
           const evt = JSON.parse(e.data);
           evt.tsStr = fmtTime(evt.ts);
           setFlows(prev => {
+            if (prev.length > 0 && prev[0].flow_id === evt.flow_id) return prev;
             if (prev.some(x => x.flow_id === evt.flow_id)) return prev;
-            return [evt, ...prev].slice(0, MAX_ALERTS);
+            const next = [evt, ...prev];
+            return next.length > MAX_ALERTS ? next.slice(0, MAX_ALERTS) : next;
           });
         } catch {}
       });
@@ -2155,7 +2171,10 @@ function App() {
         try {
           const evt = JSON.parse(e.data);
           evt.tsStr = fmtTime(evt.ts);
-          setDnsEvents(prev => [evt, ...prev].slice(0, MAX_ALERTS));
+          setDnsEvents(prev => {
+            const next = [evt, ...prev];
+            return next.length > MAX_ALERTS ? next.slice(0, MAX_ALERTS) : next;
+          });
         } catch {}
       });
 
@@ -2257,6 +2276,23 @@ function App() {
     setShowConfirm(false);
   }
 
+  async function handleDeleteSelected() {
+    setDeleting(true);
+    const ids = [...selectedIds];
+    try {
+      await fetch('/alerts/delete-selected', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ ids }),
+      });
+      setAlerts(prev => prev.filter(a => !selectedIds.has(a.id)));
+      if (selected && selectedIds.has(selected.id)) setSelected(null);
+      setSelectedIds(new Set());
+    } catch {}
+    setDeleting(false);
+    setShowDeleteConfirm(false);
+  }
+
   const handleClearFlows = async () => {
     try {
       await fetch('/flows', { method: 'DELETE' });
@@ -2278,36 +2314,45 @@ function App() {
     }
   };
 
-  // ── Derived state ──────────────────────────────────────────────────────────
-  const counts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
-  alerts.forEach(a => { counts[a.severity] = (counts[a.severity] || 0) + 1; });
+  // ── Derived state — memoized so they only recompute when alerts changes ───
+  const counts = useMemo(() => {
+    const c = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+    alerts.forEach(a => { c[a.severity] = (c[a.severity] || 0) + 1; });
+    return c;
+  }, [alerts]);
 
-  const uniqueSrcs = new Set(alerts.map(a => a.src_ip)).size;
+  const uniqueSrcs = useMemo(
+    () => new Set(alerts.map(a => a.src_ip)).size,
+    [alerts]
+  );
 
-  const topCat = (() => {
+  const topCat = useMemo(() => {
     const cc = {};
     alerts.forEach(a => { cc[a.category] = (cc[a.category] || 0) + 1; });
     let top = '—', mx = 0;
     for (const [k, v] of Object.entries(cc)) { if (v > mx) { mx = v; top = k; } }
     return { name: top, count: mx };
-  })();
+  }, [alerts]);
 
-  const topSrcs = (() => {
+  const topSrcs = useMemo(() => {
     const cc = {};
     alerts.forEach(a => { cc[a.src_ip] = (cc[a.src_ip] || 0) + 1; });
     return Object.entries(cc).sort((a, b) => b[1] - a[1]).slice(0, 5);
-  })();
+  }, [alerts]);
 
   const q = search.toLowerCase();
-  const filtered = alerts.filter(a =>
-    activeSev.has(a.severity) && (
-      !q ||
-      a.sig_msg?.toLowerCase().includes(q) ||
-      a.src_ip?.includes(q) ||
-      a.dst_ip?.includes(q) ||
-      String(a.sig_id).includes(q) ||
-      a.category?.toLowerCase().includes(q)
-    )
+  const filtered = useMemo(() =>
+    alerts.filter(a =>
+      activeSev.has(a.severity) && (
+        !q ||
+        a.sig_msg?.toLowerCase().includes(q) ||
+        a.src_ip?.includes(q) ||
+        a.dst_ip?.includes(q) ||
+        String(a.sig_id).includes(q) ||
+        a.category?.toLowerCase().includes(q)
+      )
+    ),
+    [alerts, activeSev, q]
   );
 
   function toggleSev(s) {
@@ -2612,6 +2657,14 @@ function App() {
                     color:'white', fontSize:11, fontFamily:'var(--sans)',
                     cursor: bulkSaving ? 'wait' : 'pointer', whiteSpace:'nowrap',
                   }}>{bulkSaving ? 'Saving…' : 'Apply to all'}</button>
+                  {role === 'admin' && (
+                    <button onClick={() => setShowDeleteConfirm(true)} style={{
+                      padding:'3px 12px', borderRadius:'var(--radius-sm)',
+                      border:'1px solid var(--red)', background:'var(--red-d)',
+                      color:'var(--red)', fontSize:11, fontFamily:'var(--sans)',
+                      cursor:'pointer', whiteSpace:'nowrap',
+                    }}>Delete</button>
+                  )}
                   <button onClick={() => setSelectedIds(new Set())} style={{
                     padding:'3px 9px', borderRadius:'var(--radius-sm)',
                     border:'1px solid var(--border2)', background:'transparent',
@@ -2755,6 +2808,49 @@ function App() {
           setWhLoading={setWhLoading}
           onRefreshWebhooks={fetchWebhooks}
         />
+      )}
+
+      {/* Confirm delete selected alerts modal */}
+      {showDeleteConfirm && (
+        <div className="modal-bg" onClick={() => setShowDeleteConfirm(false)}>
+          <div className="modal" onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 10 }}>
+              Delete {selectedIds.size} selected alert{selectedIds.size !== 1 ? 's' : ''}?
+            </div>
+            <div style={{
+              fontSize: 12, color: 'var(--text2)',
+              lineHeight: 1.7, marginBottom: 24,
+            }}>
+              This will permanently remove{' '}
+              <b style={{ color: 'var(--text1)' }}>
+                {selectedIds.size} alert{selectedIds.size !== 1 ? 's' : ''}
+              </b>{' '}
+              and their acknowledgement history. This action cannot be undone.
+            </div>
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button className="btn"
+                      onClick={() => setShowDeleteConfirm(false)}
+                      disabled={deleting}
+                      style={{ minWidth: 80 }}>
+                Cancel
+              </button>
+              <button onClick={handleDeleteSelected}
+                      disabled={deleting}
+                      style={{
+                        minWidth: 80, padding: '4px 14px',
+                        borderRadius: 'var(--radius-sm)',
+                        border: '1px solid var(--red)',
+                        background: 'var(--red-d)',
+                        color: 'var(--red)', fontSize: 11,
+                        fontFamily: 'var(--sans)',
+                        cursor: deleting ? 'wait' : 'pointer',
+                        transition: 'all .15s',
+                      }}>
+                {deleting ? 'Deleting…' : `Yes, delete ${selectedIds.size}`}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Confirm clear alerts modal */}
