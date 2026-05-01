@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+case "$1" in
+  purge)
+    rm -rf /var/lib/watcher /etc/watcher
+    deluser  --system watcher  2>/dev/null || true
+    delgroup --system watcher  2>/dev/null || true
+    systemctl daemon-reload    2>/dev/null || true
+    ;;
+  remove)
+    systemctl daemon-reload    2>/dev/null || true
+    ;;
+esac
+exit 0

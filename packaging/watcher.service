@@ -1,0 +1,33 @@
+[Unit]
+Description=Watcher IDS Dashboard
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=watcher
+Group=watcher
+WorkingDirectory=/opt/watcher
+EnvironmentFile=-/etc/watcher/watcher.conf
+ExecStart=/usr/bin/python3 /opt/watcher/server.py $WATCHER_ARGS
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=watcher
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/watcher
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

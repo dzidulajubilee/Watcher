@@ -1,0 +1,71 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  configure)
+    # ── Create system user ────────────────────────────────────────────────────
+    if ! id -u watcher >/dev/null 2>&1; then
+      adduser --system --group --no-create-home \
+              --home /var/lib/watcher \
+              --shell /usr/sbin/nologin \
+              --gecos "Watcher IDS" \
+              watcher
+      echo "Created system user: watcher"
+    fi
+
+    # ── Add watcher to suricata group for eve.json read access ────────────────
+    if getent group suricata >/dev/null 2>&1; then
+      usermod -aG suricata watcher
+      echo "Added watcher to suricata group (eve.json access granted)."
+    else
+      echo "Note: suricata group not found — install Suricata first, then run:"
+      echo "      usermod -aG suricata watcher && systemctl restart watcher"
+    fi
+
+    # ── Directories and ownership ─────────────────────────────────────────────
+    chown -R root:watcher /opt/watcher
+    chmod -R o-rwx /opt/watcher
+    chmod 755 /opt/watcher
+
+    chown watcher:watcher /var/lib/watcher
+    chmod 750 /var/lib/watcher
+
+    chown root:watcher /etc/watcher
+    chmod 750 /etc/watcher
+    if [ -f /etc/watcher/watcher.conf ]; then
+      chown root:watcher /etc/watcher/watcher.conf
+      chmod 640 /etc/watcher/watcher.conf
+    fi
+
+    # ── Systemd ───────────────────────────────────────────────────────────────
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable watcher.service   2>/dev/null || true
+
+    if systemctl is-active --quiet watcher.service 2>/dev/null; then
+      systemctl restart watcher.service
+      echo "Restarted watcher service."
+    else
+      systemctl start watcher.service 2>/dev/null || true
+      echo "Started watcher service."
+    fi
+
+    echo ""
+    echo "┌─────────────────────────────────────────────────────────┐"
+    echo "│  Watcher IDS v1.1.0 installed successfully              │"
+    echo "│                                                         │"
+    echo "│  Dashboard  →  http://localhost:8765/                   │"
+    echo "│  Logs       →  journalctl -u watcher -f                 │"
+    echo "│  Status     →  systemctl status watcher                 │"
+    echo "│  Config     →  /etc/watcher/watcher.conf                │"
+    echo "│                                                         │"
+    echo "│  New in v1.1.0:                                         │"
+    echo "│    • Explain button on any selected alert               │"
+    echo "│    • Threat Intel — Settings → Threat Intel             │"
+    echo "│    • Suppression Rules — Settings → Suppression         │"
+    echo "│    • watcher user added to suricata group               │"
+    echo "└─────────────────────────────────────────────────────────┘"
+    echo ""
+    ;;
+esac
+
+exit 0
