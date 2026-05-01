@@ -1,431 +1,317 @@
 # 👁 Watcher IDS Dashboard
 
-A lightweight, self-hosted web dashboard for [Suricata](https://suricata.io/) IDS alerts. Watcher tails your `eve.json` log in real time, stores events in SQLite, and streams them to your browser over Server-Sent Events (SSE).
+A self-hosted, real-time intrusion detection dashboard for [Suricata](https://suricata.io).  
+Reads `eve.json`, streams live alerts, and presents everything in a fast single-page UI with no external dependencies at runtime.
 
-No Node.js, no build step, no external services — just Python 3.11+ and a browser.
-
----
-
-## Table of Contents
-
-- [Features](#features)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [First Run](#first-run)
-- [Usage](#usage)
-- [Configuration](#configuration)
-- [Project Structure](#project-structure)
-- [Architecture](#architecture)
-- [API Reference](#api-reference)
-- [Role-Based Access Control](#role-based-access-control)
-- [Webhooks](#webhooks)
-- [Database](#database)
-- [Security Notes](#security-notes)
-- [Upgrading](#upgrading)
 
 ---
 
 ## Features
 
-- **Real-time alert stream** via SSE — no polling, no page refresh
-- **Multi-event support** — alerts, flows, DNS, HTTP events from eve.json
-- **RBAC** — three roles: `admin`, `analyst`, `viewer`
-- **Alert acknowledgement** — mark alerts as acknowledged, false positive, or under investigation, with full history
-- **Webhook notifications** — Slack, Discord, or any generic JSON endpoint, with per-severity filters and per-signature cooldown
-- **Charts** — top talkers, alert trend (hourly/daily), by category, by severity
-- **Multiple themes** — Night, Light, Midnight Blue, Solarized Dark, Dracula, Nord
-- **Dual-database design** — high-volume event writes never contend with auth/session lookups
-- **Self-contained** — single directory, two SQLite files, no runtime dependencies beyond the stdlib
+| Category | Details |
+|---|---|
+| **Live streaming** | Server-Sent Events push alerts, flows, DNS, and HTTP events to all connected browsers the instant Suricata writes them |
+| **Alert management** | Acknowledge, investigate, or mark as false positive — individually or in bulk. Full audit history per alert |
+| **Threat Intel** | Custom per-SID or per-category explanations written by your team. Coverage gap view shows your top-firing unexlained signatures |
+| **Suppression rules** | Silence known-noisy signatures by SID, source IP, or category — with optional expiry dates |
+| **Charts** | Alert trend, top talkers, severity distribution, category breakdown — across 24h / 7d / 30d / 60d / 90d |
+| **Flow events** | Full Suricata flow records with bytes, packets, duration, app-proto |
+| **DNS events** | Every query and response with answers, TTL, rcode |
+| **Webhooks** | Slack, Discord, or generic JSON — per-severity filtering and per-signature cooldown |
+| **RBAC** | Three roles: `admin` (full), `analyst` (read + ack), `viewer` (stream only) |
+| **Themes** | Night · Light · Midnight Blue · Solarized Dark · Dracula · Nord |
 
 ---
 
-## Requirements
+## Architecture
 
-- Python **3.11** or later (uses `str | None` union syntax)
-- Suricata writing `eve.json` (any recent version)
-- A modern browser
+```
+Suricata ──► eve.json ──► tail.py ──► SQLite (events.db / dns.db)
+                                   └──► SSE registry ──► browsers
+                                   └──► Webhook queue ──► Slack / Discord
 
-No pip packages are required. All dependencies are Python stdlib.
+Browser ◄──► Python HTTP server (handlers.py)
+              ├── /            → frontend/index.html  (React SPA)
+              ├── /alerts      → REST API (JSON)
+              ├── /events      → SSE stream
+              ├── /threat-intel→ Threat Intel API
+              ├── /suppression → Suppression rules API
+              └── /frontend/*  → Static assets (pre-built by Vite)
+```
+
+**No Node.js on the server.** The frontend is compiled once (by you, during a build) and shipped as plain JS. The Python server just serves static files.
+
+### Databases
+
+| File | Contents |
+|---|---|
+| `events.db` | alerts, flows, http\_events, ack\_history |
+| `dns.db` | dns\_events (separated — high write volume) |
+| `config.db` | auth, sessions, users, webhooks, threat\_intel, suppression\_rules |
+
+---
+
+## Repository layout
+
+```
+watcher/
+├── backend/                  Python server — all source files
+│   ├── server.py             Entry point, wires everything together
+│   ├── handlers.py           HTTP routing and all API endpoints
+│   ├── tail.py               eve.json tail thread + suppression check
+│   ├── database.py           AlertDB — alerts, flows, http, ack
+│   ├── database_dns.py       DnsDB — high-volume DNS events
+│   ├── config_db.py          ConfigDB — SQLite wrapper for config tables
+│   ├── auth.py               Session management
+│   ├── users.py              RBAC user management
+│   ├── webhooks.py           Webhook engine (Slack / Discord / generic)
+│   ├── threat_intel.py       Threat Intel database
+│   ├── suppression.py        Suppression rules — in-memory cached engine
+│   ├── registry.py           SSE client fan-out
+│   ├── password_utils.py     PBKDF2-SHA256 hashing
+│   ├── migrate.py            One-time DB migration tool
+│   └── config.py             Runtime constants (dev paths)
+│
+├── frontend-src/             React source — edit this, then `npm run build`
+│   ├── src/
+│   │   ├── main.jsx          Entry point
+│   │   ├── App.jsx           Root component — all state and SSE wiring
+│   │   ├── Detail.jsx        Alert detail panel (Details / History / Raw JSON)
+│   │   ├── Charts.jsx        All SVG chart components
+│   │   ├── FlowsDns.jsx      Flow and DNS views
+│   │   ├── Settings.jsx      Users + Webhooks settings
+│   │   ├── ThreatIntel.jsx   Explain dialog + Threat Intel panel
+│   │   ├── Suppression.jsx   Suppression rules panel
+│   │   ├── components.jsx    Shared: Clock, Sparkline, Timeline, AckBadge
+│   │   ├── themes.jsx        Theme definitions and ThemePicker
+│   │   ├── utils.js          fmtTime, fmtBytes, fmtDur, constants
+│   │   └── styles.css        All CSS (theme vars + layout + components)
+│   ├── public/
+│   │   ├── login.html        Login page
+│   │   └── login.js          Login page logic
+│   ├── index.html            Vite entry HTML
+│   ├── vite.config.js        Vite config (base, outDir, dev proxy)
+│   └── package.json
+│
+├── packaging/                .deb packaging support files
+│   ├── postinst              Runs after install (create user, systemd, groups)
+│   ├── prerm                 Runs before remove (stop service)
+│   ├── postrm                Runs after purge (clean up data)
+│   ├── watcher.service       systemd unit with security hardening
+│   └── watcher.conf          Default config file (/etc/watcher/watcher.conf)
+│
+├── .github/workflows/
+│   └── build.yml             GitHub Actions: build .deb on tag push
+│
+├── build-deb.sh              Build script — produces the installable .deb
+└── README.md
+```
 
 ---
 
 ## Installation
 
+### Option A — Install the pre-built .deb (recommended)
+
+Download the latest `.deb` from the [Releases](../../releases) page:
+
 ```bash
-git clone https://github.com/yourname/watcher.git
-cd watcher
+sudo apt install ./watcher-ids_1.1.0_all.deb
 ```
 
-That's it. There is nothing to install.
+That's it. The installer:
+- Creates a locked-down `watcher` system user
+- Adds `watcher` to the `suricata` group (eve.json read access)
+- Starts `watcher.service` via systemd
+- Auto-generates credentials on first run
+
+Get your credentials:
+```bash
+journalctl -u watcher | grep -A2 PASSWORD
+```
+
+Open the dashboard: `http://your-server:8765/`
 
 ---
 
-## First Run
+### Option B — Build the .deb yourself
+
+**Prerequisites:** Node.js 18+, `dpkg-deb`
 
 ```bash
-python3 server.py
+git clone https://github.com/dzidulajubilee/Watcher.git
+cd watcher-ids
+./build-deb.sh 1.1.0
+sudo apt install ./packaging/build/watcher-ids_1.1.0_all.deb
 ```
 
-On first run, Watcher generates a random admin password and prints it to the console:
-
-```
-========================================================
-  RBAC enabled — first Admin account created:
-  Username: admin
-  Password: xK9mT2vQpLwRnY
-  Change:   Settings → Users → Edit
-========================================================
-```
-
-Open `http://localhost:8765/login` and sign in.
-
-To set a specific password before starting the server:
-
-```bash
-python3 server.py --password mysecretpassword
-```
+The build script installs npm dependencies, compiles the frontend with Vite, assembles the package tree, and calls `dpkg-deb`.
 
 ---
 
-## Usage
-
-```
-python3 server.py [OPTIONS]
-
-Options:
-  --eve PATH          Path to Suricata eve.json
-                      default: /var/log/suricata/eve.json
-  --port INT          TCP port to listen on
-                      default: 8765
-  --host ADDR         Bind address
-                      default: 0.0.0.0
-  --db PATH           Path to events database (alerts, flows, dns, http)
-                      default: ./events.db
-  --config-db PATH    Path to config database (auth, sessions, users, webhooks)
-                      default: ./config.db
-  --retain-days INT   Days to keep events in the database
-                      default: 90
-  --password TEXT     Set or change the dashboard password, then exit
-```
-
-### Examples
+### Option C — Run directly (development)
 
 ```bash
-# Default — eve.json at the standard Suricata path
+# Clone and install frontend deps once
+git clone https://github.com/dzidulajubilee/Watcher.git
+cd watcher-ids
+cd frontend-src && npm install && npm run build && cd ..
+
+# Run the server (from the backend directory)
+cd backend
 python3 server.py
 
-# Custom paths
-python3 server.py \
-  --eve /var/log/suricata/eve.json \
-  --db /var/lib/watcher/events.db \
-  --config-db /var/lib/watcher/config.db \
-  --port 9000
-
-# Change the admin password
-python3 server.py --password newpassword
-```
-
-### Running as a systemd service
-
-```ini
-# /etc/systemd/system/watcher.service
-[Unit]
-Description=Watcher IDS Dashboard
-After=network.target suricata.service
-
-[Service]
-Type=simple
-User=watcher
-WorkingDirectory=/opt/watcher
-ExecStart=/usr/bin/python3 server.py \
-    --eve /var/log/suricata/eve.json \
-    --db /var/lib/watcher/events.db \
-    --config-db /var/lib/watcher/config.db
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-systemctl daemon-reload
-systemctl enable --now watcher
+# With options
+python3 server.py --eve /var/log/suricata/eve.json --port 8765 --retain-days 90
 ```
 
 ---
 
 ## Configuration
 
-Runtime constants live in `config.py`. CLI arguments override the relevant ones at startup.
+Edit `/etc/watcher/watcher.conf` (preserved across upgrades):
 
-| Constant | Default | Description |
+```bash
+# Uncomment and customise ONE WATCHER_ARGS line
+WATCHER_ARGS=--eve /var/log/suricata/eve.json --port 8765 --retain-days 30
+
+systemctl restart watcher
+```
+
+| Flag | Default | Description |
 |---|---|---|
-| `DEFAULT_EVE` | `/var/log/suricata/eve.json` | Suricata event log |
-| `DEFAULT_PORT` | `8765` | HTTP listen port |
-| `DEFAULT_HOST` | `0.0.0.0` | Bind address |
-| `DEFAULT_DB` | `./events.db` | Events database path |
-| `DEFAULT_CONFIG_DB` | `./config.db` | Config database path |
-| `RETAIN_DAYS` | `90` | Event retention window (days) |
-| `PURGE_EVERY` | `3600` | Seconds between purge cycles |
-| `PING_EVERY` | `10` | SSE keep-alive interval (seconds) |
-| `MAX_QUEUE` | `500` | Max queued SSE messages per client |
-| `SESSION_TTL` | `604800` | Session cookie lifetime (7 days) |
-| `PBKDF2_ITERS` | `260000` | PBKDF2-SHA256 iteration count |
-| `FRONTEND_DIR` | `./frontend/` | Static file directory |
+| `--eve` | `/var/log/suricata/eve.json` | Path to Suricata eve.json |
+| `--port` | `8765` | TCP port to listen on |
+| `--host` | `0.0.0.0` | Bind address |
+| `--retain-days` | `90` | Days to keep events in SQLite |
+| `--db` | `/var/lib/watcher/events.db` | Events database path |
+| `--dns-db` | `/var/lib/watcher/dns.db` | DNS database path |
+| `--config-db` | `/var/lib/watcher/config.db` | Config database path |
+| `--password` | — | Set/change admin password, then exit |
 
 ---
 
-## Project Structure
+## RBAC — Roles
 
-```
-watcher/
-│
-├── server.py           Entry point — wires all modules, starts HTTP server
-├── config.py           Runtime constants and default paths
-│
-├── database.py         AlertDB — SQLite wrapper for high-volume event tables
-│                         (alerts, flows, dns_events, http_events, ack_history)
-├── config_db.py        ConfigDB — SQLite wrapper for config tables
-│                         (auth, sessions, users, webhooks)
-│
-├── auth.py             AuthManager — session management, legacy single-password
-├── users.py            UserManager — RBAC user accounts
-├── password_utils.py   Shared PBKDF2-SHA256 hash / verify helpers
-│
-├── handlers.py         HTTP request handler — all routes
-├── registry.py         SSE client registry — thread-safe fan-out
-├── tail.py             eve.json tail thread — parses and dispatches events
-├── webhooks.py         WebhookDB + async HTTP delivery engine
-│
-└── frontend/
-    ├── index.html      Dashboard shell (loads React via CDN)
-    ├── app.jsx         React application (Babel transpiled in-browser)
-    ├── styles.css      Theme variables and global styles
-    ├── login.html      Login page
-    └── login.js        Login page logic
-```
-
----
-
-## Architecture
-
-### Dual-Database Design
-
-Watcher uses two separate SQLite files:
-
-```
-events.db   ←  alerts, flows, dns_events, http_events, ack_history
-config.db   ←  auth, sessions, users, webhooks
-```
-
-The events database receives a continuous stream of writes from the tail thread. The config database is almost never written to (only on login and user changes). Keeping them separate means a heavy alert ingestion burst never delays a session lookup or login, even under WAL mode.
-
-### Threading Model
-
-```
-main thread
-  └── ThreadedHTTPServer (one thread per HTTP connection)
-        ├── GET /events  → long-lived SSE thread per browser tab
-        └── GET/POST/*   → short-lived request threads
-
-daemon threads
-  ├── tail_thread    — reads eve.json line by line, writes to events.db,
-  │                    broadcasts SSE via Registry
-  ├── purge_thread   — hourly: deletes old rows, purges expired sessions
-  └── webhooks       — drains delivery queue, retries failed HTTP POSTs
-```
-
-### SSE Fan-out
-
-Each browser tab connecting to `/events` gets a `Queue` registered in the `Registry`. When the tail thread processes a new event, `registry.broadcast()` puts a formatted SSE message into every connected client's queue. Clients whose queues are full (e.g. a stalled tab) are silently dropped and will reconnect automatically via the browser's `EventSource` retry.
-
-### Password Hashing
-
-All passwords (both the legacy single-password and RBAC user passwords) are hashed with PBKDF2-SHA256 at 260,000 iterations using a random 16-byte hex salt. The implementation lives in `password_utils.py` and is shared by `AuthManager` and `UserManager`.
-
----
-
-## API Reference
-
-All endpoints except `/login`, `/logout`, and `/frontend/login.js` require a valid session cookie (`suri_session`).
-
-### Authentication
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/login` | Sign in. Body: `{"username": "...", "password": "..."}` |
-| `GET` | `/logout` | Revoke session, redirect to `/login` |
-| `GET` | `/me` | Returns `{"username": "...", "role": "..."}` |
-
-### Events
-
-| Method | Path | Query params | Description |
-|---|---|---|---|
-| `GET` | `/alerts` | `days`, `limit` | Recent alerts (JSON array) |
-| `GET` | `/flows` | `days`, `limit` | Recent flow events |
-| `GET` | `/dns` | `days`, `limit` | Recent DNS events |
-| `GET` | `/http` | `days`, `limit` | Recent HTTP events |
-| `GET` | `/events` | — | SSE stream (keep-alive) |
-
-Query params default: `days=90`, `limit=5000`. Max: `limit=20000`.
-
-### Alert Acknowledgement
-
-| Method | Path | Body | Description |
-|---|---|---|---|
-| `POST` | `/alerts/<id>/ack` | `{"status": "...", "note": "..."}` | Acknowledge one alert |
-| `POST` | `/alerts/bulk-ack` | `{"ids": [...], "status": "...", "note": "..."}` | Acknowledge multiple alerts |
-| `GET` | `/alerts/<id>/ack/history` | — | Full acknowledgement history |
-
-Valid statuses: `new`, `acknowledged`, `false_positive`, `investigating`.
-
-### Charts
-
-| Method | Path | Query params | Description |
-|---|---|---|---|
-| `GET` | `/charts` | `days`, `trend` | Top talkers, trend, by category, by severity |
-
-`trend` is in hours (24–2160). Values above 24 are bucketed by day automatically.
-
-### Webhooks *(admin only)*
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/webhooks` | List all webhooks |
-| `POST` | `/webhooks` | Create webhook |
-| `PUT` | `/webhooks/<id>` | Update webhook |
-| `DELETE` | `/webhooks/<id>` | Delete webhook |
-| `POST` | `/webhooks/<id>/test` | Fire a test alert |
-
-Webhook body fields: `name`, `type` (`slack`/`discord`/`generic`), `url`, `severities` (array), `enabled` (bool).
-
-### Users *(admin only)*
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/users` | List all users |
-| `POST` | `/users` | Create user. Body: `{"username", "password", "role"}` |
-| `PUT` | `/users/<id>` | Update user (role, enabled, username, password) |
-| `DELETE` | `/users/<id>` | Delete user |
-
-### System
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | `{"status": "ok", "clients": N, "db": {...}, "time": epoch}` |
-| `DELETE` | `/alerts` | Wipe all alerts *(admin only)* |
-| `DELETE` | `/flows` | Wipe all flows *(admin only)* |
-| `DELETE` | `/dns` | Wipe all DNS events *(admin only)* |
-
----
-
-## Role-Based Access Control
-
-| Capability | admin | analyst | viewer |
+| Permission | Admin | Analyst | Viewer |
 |---|:---:|:---:|:---:|
-| View alerts, flows, DNS, HTTP | ✓ | ✓ | ✓ (alerts only) |
-| Receive SSE stream | ✓ | ✓ | ✓ |
-| Acknowledge / annotate alerts | ✓ | ✓ | — |
-| Bulk acknowledge | ✓ | ✓ | — |
-| Clear event tables | ✓ | — | — |
+| View alerts / flows / DNS / charts | ✓ | ✓ | ✓ |
+| Alert detail panel | ✓ | ✓ | — |
+| Acknowledge / bulk-ack alerts | ✓ | ✓ | — |
+| Explain (Threat Intel lookup) | ✓ | ✓ | — |
+| Clear alerts / flows / DNS | ✓ | — | — |
 | Manage webhooks | ✓ | — | — |
+| Manage suppression rules | ✓ | — | — |
+| Add / edit Threat Intel | ✓ | ✓ | — |
+| Delete Threat Intel entries | ✓ | — | — |
 | Manage users | ✓ | — | — |
 
-The last admin account cannot be demoted, disabled, or deleted. An admin cannot delete their own account.
+---
 
-### Emergency Fallback
+## Threat Intel
 
-If RBAC users are unavailable, the original single-password mechanism still works. Sign in with username `admin` and the password set via `--password`. This creates an admin session and is intended for recovery only.
+The **Explain** button appears in the alert toolbar whenever an alert is selected.  
+Clicking it opens a dialog showing your team's saved explanation for that signature.
+
+Explanations can be scoped to:
+- **Exact SID** — applies only to one specific Suricata signature (highest priority)
+- **Category** — applies to all alerts of that category (fallback)
+
+Each entry supports free-text explanation, tags, and reference URLs.
+
+Manage entries at **Settings → Threat Intel**. The **Coverage Gaps** tab shows your most-fired signatures that have no explanation yet, sorted by fire count.
+
+---
+
+## Suppression Rules
+
+Suppression silences alerts *before* they are stored or broadcast. Rules match on any combination of:
+
+- `sig_id` — exact Suricata signature ID
+- `src_ip` — exact source IP address  
+- `category` — alert category (case-insensitive)
+
+All specified conditions must match (AND logic). Rules can have an optional expiry date — expired rules are kept for audit purposes but no longer applied.
+
+Rules are cached in memory and refreshed from the database every 30 seconds, so changes take effect quickly without a restart.
+
+Manage at **Settings → Suppression** (admin only).
 
 ---
 
 ## Webhooks
 
-Webhooks are delivered asynchronously by a background thread so they never block the tail thread or SSE stream.
+Watcher supports **Slack**, **Discord**, and **Generic JSON** webhooks.  
+Each webhook has its own severity filter and a 60-second per-signature cooldown (configurable in `webhooks.py`) to prevent alert storms.
 
-**Supported targets:**
-- **Slack** — Block Kit payload with severity colour coding
-- **Discord** — Embed payload with colour-coded severity fields
-- **Generic** — Plain JSON, compatible with Teams, Mattermost, and custom endpoints
-
-**Per-severity filtering:** each webhook independently chooses which severity levels trigger it (`critical`, `high`, `medium`, `low`, `info`).
-
-**Cooldown:** the same `(webhook_id, signature_id, src_ip)` triple will not re-fire within 60 seconds (configurable via `COOLDOWN_SECS` in `webhooks.py`). Repeated hits from the same host are throttled; different source IPs for the same rule are never suppressed.
-
-**Retry:** failed deliveries are retried up to 3 times with a 5-second delay. The last error and fire count are stored in the database and visible in the UI.
-
----
-
-## Database
-
-### events.db
-
-| Table | Key columns | Purpose |
-|---|---|---|
-| `alerts` | `id`, `ts_epoch`, `severity`, `sig_id` | Suricata alert events |
-| `flows` | `flow_id`, `ts_epoch` | Network flow records |
-| `dns_events` | `id`, `ts_epoch`, `rrname` | DNS query/response events |
-| `http_events` | `id`, `ts_epoch`, `hostname` | HTTP transaction events |
-| `ack_history` | `alert_id`, `changed_at` | Per-alert acknowledgement audit log |
-
-**Indexes:** `ts_epoch` (all tables), `severity` (alerts), composite `(ts_epoch, severity)` (alerts), `rrname` (dns), `hostname` (http), `alert_id` (ack_history).
-
-### config.db
-
-| Table | Purpose |
-|---|---|
-| `auth` | Single key-value store for the legacy password hash |
-| `sessions` | Active session tokens with username, role, and expiry |
-| `users` | RBAC user accounts |
-| `webhooks` | Webhook configurations and delivery stats |
-
-Both databases use `PRAGMA journal_mode = WAL` and `PRAGMA synchronous = NORMAL`. Each thread gets its own connection via `threading.local`.
-
-### Retention and Purge
-
-The purge thread runs every `PURGE_EVERY` seconds and deletes rows older than `retain_days` from all four event tables in a single transaction. Expired sessions are purged in the same cycle.
-
----
-
-## Security Notes
-
-- All passwords are hashed with PBKDF2-SHA256 (260,000 rounds, random 16-byte salt). The hash format is `salt$hex_digest`.
-- Session tokens are 256-bit random hex strings (`secrets.token_hex(32)`).
-- Session cookies are `HttpOnly; SameSite=Strict`.
-- Failed login attempts incur a 1-second delay (no lockout, but rate-limits brute force from a single connection).
-- The `Server:` header is suppressed to avoid triggering Suricata SID 2034635 against the dashboard itself.
-- Static files are served with a path traversal check: the resolved target path must be inside `FRONTEND_DIR`.
-- It is strongly recommended to run Watcher behind a TLS-terminating reverse proxy (nginx, Caddy) in production. The built-in server speaks plain HTTP.
+Test any webhook from the Settings panel without waiting for a real alert.
 
 ---
 
 ## Upgrading
 
-### From single-file (pre-RBAC) to current
-
-Watcher will detect an existing `alerts.db` (the old combined database) on startup. The schema migration runs automatically — `ack_status`, `ack_note`, `ack_by`, `ack_at` columns are added to `alerts` if absent, and `username`/`role` columns are added to `sessions` if absent.
-
-Sessions without a `username` are invalidated at startup so all users re-authenticate under RBAC.
-
-### Database path change (events.db / config.db)
-
-If you are upgrading from a version that used a single `alerts.db`, You'll first need to migrate
-
-
 ```bash
-python3 migrate.py --source /path/to/alerts.db --dry-run
-
-python3 migrate.py --source /path/to/alerts.db
+sudo apt install ./watcher-ids_1.x.x_all.deb
 ```
 
-Demo run available pass the old database with `-db` and let `--config-db` default to a new `config.db`:
+dpkg stops the running service, replaces files, restarts. Databases survive untouched. `/etc/watcher/watcher.conf` is preserved as a dpkg conffile.
+
+---
+
+## Uninstalling
 
 ```bash
-python3 server.py --db /path/to/alerts.db
+sudo apt remove watcher-ids       # removes files, keeps databases and config
+sudo apt purge  watcher-ids       # removes everything including /var/lib/watcher
 ```
 
-The config tables (`auth`, `sessions`, `users`, `webhooks`) will be initialised fresh in the new `config.db` and the events tables remain in the path you provided.
+---
+
+## Frontend development (hot reload)
+
+```bash
+# Terminal 1 — Python backend
+cd backend && python3 server.py
+
+# Terminal 2 — Vite dev server
+cd frontend-src && npm run dev
+```
+
+Open `http://localhost:5173/` — Vite proxies all API calls to port 8765.  
+Changes to any `.jsx` or `.css` file appear in the browser instantly.
+
+When satisfied, build for production:
+```bash
+cd frontend-src && npm run build
+```
+
+---
+
+## GitHub Actions
+
+Pushing a tag triggers an automatic build and GitHub Release:
+
+```bash
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+The workflow installs Node, builds the frontend, assembles the `.deb`, and attaches it to the release. No secrets needed — only the default `GITHUB_TOKEN`.
+
+---
+
+## Requirements
+
+**Server (runtime)**
+- Debian / Ubuntu (any recent release)
+- Python 3.10 or later (standard library only — no pip installs)
+- Suricata writing `eve.json`
+
+**Build machine (one-time, not needed on server)**
+- Node.js 18+ and npm (to compile the frontend)
+- `dpkg-deb` (pre-installed on Debian/Ubuntu)
+
+---
 
 ## License
 
