@@ -37,18 +37,76 @@ case "$1" in
       chmod 640 /etc/watcher/watcher.conf
     fi
 
+    # ── Bootstrap admin credentials (first install only) ─────────────────────
+    # Generate the password and seed the DB *before* starting the service so
+    # we can display it in the banner below.  On upgrades the DB already has
+    # users, so the Python snippet exits without changing anything.
+    CONFIG_DB="/var/lib/watcher/config.db"
+
+    ADMIN_PW=$(python3 - "$CONFIG_DB" <<'PYEOF'
+import sys, sqlite3, secrets, hashlib, time
+
+db_path = sys.argv[1]
+con = sqlite3.connect(db_path)
+
+# Mirror the exact schema from users.py / config_db.py
+con.executescript("""
+    CREATE TABLE IF NOT EXISTS sessions (
+        token      TEXT PRIMARY KEY,
+        created_at REAL NOT NULL,
+        expires_at REAL NOT NULL,
+        username   TEXT DEFAULT '',
+        role       TEXT DEFAULT 'admin'
+    );
+    CREATE TABLE IF NOT EXISTS users (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        username   TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+        pw_hash    TEXT    NOT NULL,
+        role       TEXT    NOT NULL DEFAULT 'analyst',
+        enabled    INTEGER NOT NULL DEFAULT 1,
+        created_at REAL    NOT NULL,
+        last_login REAL
+    );
+""")
+con.commit()
+
+# Only seed if no users exist yet (skip on upgrades)
+count = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+if count > 0:
+    print("")
+    con.close()
+    sys.exit(0)
+
+pw   = secrets.token_urlsafe(14)
+salt = secrets.token_hex(16)
+h    = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 260_000)
+pw_hash = f"{salt}${h.hex()}"
+
+con.execute(
+    "INSERT INTO users (username, pw_hash, role, enabled, created_at) VALUES (?,?,?,1,?)",
+    ("admin", pw_hash, "admin", time.time()),
+)
+con.commit()
+con.close()
+print(pw)
+PYEOF
+    )
+
+    # Lock down the DB so only the watcher group can read it
+    chown watcher:watcher "$CONFIG_DB" 2>/dev/null || true
+    chmod 640 "$CONFIG_DB"             2>/dev/null || true
+
     # ── Systemd ───────────────────────────────────────────────────────────────
     systemctl daemon-reload 2>/dev/null || true
     systemctl enable watcher.service   2>/dev/null || true
 
     if systemctl is-active --quiet watcher.service 2>/dev/null; then
       systemctl restart watcher.service
-      echo "Restarted watcher service."
     else
       systemctl start watcher.service 2>/dev/null || true
-      echo "Started watcher service."
     fi
 
+    # ── Install banner ────────────────────────────────────────────────────────
     echo ""
     echo "┌─────────────────────────────────────────────────────────┐"
     echo "│  Watcher IDS v1.1.0 installed successfully              │"
@@ -57,6 +115,17 @@ case "$1" in
     echo "│  Logs       →  journalctl -u watcher -f                 │"
     echo "│  Status     →  systemctl status watcher                 │"
     echo "│  Config     →  /etc/watcher/watcher.conf                │"
+    echo "│                                                         │"
+
+    if [ -n "$ADMIN_PW" ]; then
+      echo "│  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  │"
+      echo "│  First-run credentials                                  │"
+      echo "│    Username  →  admin                                   │"
+      printf "│    Password  →  %-38s │\n" "$ADMIN_PW"
+      echo "│    Change:      Settings → Users → Edit                 │"
+      echo "│  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  │"
+    fi
+
     echo "│                                                         │"
     echo "│  New in v1.1.0:                                         │"
     echo "│    • Explain button on any selected alert               │"

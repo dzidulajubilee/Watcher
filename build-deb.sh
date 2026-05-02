@@ -25,6 +25,7 @@ rm -rf "${BUILD}"
 mkdir -p \
   "${BUILD}/DEBIAN" \
   "${BUILD}/opt/watcher/frontend/assets" \
+  "${BUILD}/opt/watcher/frontend/fonts" \
   "${BUILD}/var/lib/watcher" \
   "${BUILD}/lib/systemd/system" \
   "${BUILD}/etc/watcher"
@@ -79,6 +80,7 @@ cp "${ROOT}/frontend/index.html"    "${BUILD}/opt/watcher/frontend/"
 cp "${ROOT}/frontend/login.html"    "${BUILD}/opt/watcher/frontend/"
 cp "${ROOT}/frontend/login.js"      "${BUILD}/opt/watcher/frontend/"
 cp "${ROOT}/frontend/assets/"*      "${BUILD}/opt/watcher/frontend/assets/"
+cp "${ROOT}/frontend/fonts/"*       "${BUILD}/opt/watcher/frontend/fonts/"
 
 # ── 6. Systemd + config ───────────────────────────────────────────────────────
 cp "${ROOT}/packaging/watcher.service" "${BUILD}/lib/systemd/system/watcher.service"
