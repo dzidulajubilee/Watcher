@@ -407,6 +407,142 @@ function WebhooksView({ webhooks, onRefresh, triggerNew }) {
 }
 
 // ── SettingsView ──────────────────────────────────────────────────────────────
+// ── AiExplainPanel ────────────────────────────────────────────────────────────
+function AiExplainPanel({ role }) {
+  const [status,  setStatus]  = useState(null);   // { key_source, key_hint }
+  const [loading, setLoading] = useState(true);
+  const [saving,  setSaving]  = useState(false);
+  const [newKey,  setNewKey]  = useState('');
+  const [msg,     setMsg]     = useState(null);   // { text, ok }
+
+  useEffect(() => {
+    fetch('/settings/explain')
+      .then(r => r.json())
+      .then(d => { setStatus(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, []);
+
+  async function saveKey() {
+    setSaving(true); setMsg(null);
+    const res = await fetch('/settings/explain', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: newKey.trim() || null }),
+    }).then(r => r.json()).catch(() => null);
+    setSaving(false);
+    if (!res) { setMsg({ text: 'Save failed — network error.', ok: false }); return; }
+    setStatus(res);
+    setNewKey('');
+    setMsg({ text: newKey.trim()
+      ? `Key saved (${res.key_hint}). Source: ${res.key_source}.`
+      : 'Key cleared. Falling back to watcher.conf env var.', ok: true });
+  }
+
+  function clearKey() { setNewKey(''); saveKey(); }
+
+  if (loading) return (
+    <div style={{ padding: 24, color: 'var(--text3)', fontFamily: 'var(--mono)', fontSize: 12 }}>
+      Loading…
+    </div>
+  );
+
+  const srcLabel = { db: 'Settings UI (DB override)', env: 'watcher.conf (DEEPSEEK_API_KEY)', none: 'Not configured' };
+
+  return (
+    <div style={{ padding: 20, maxWidth: 560 }}>
+      <div className="wh-section">
+        <div className="wh-section-title">DeepSeek API Key</div>
+
+        {/* Current status */}
+        <div className="wh-card" style={{ marginBottom: 16 }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{
+              fontSize: 9, fontFamily: 'var(--mono)', letterSpacing: '.08em',
+              textTransform: 'uppercase', padding: '2px 8px', borderRadius: 20,
+              background: status?.key_source === 'none' ? 'rgba(240,84,84,.1)' : 'rgba(52,199,89,.1)',
+              color:      status?.key_source === 'none' ? 'var(--red)'         : 'var(--green)',
+              border:     status?.key_source === 'none' ? '1px solid rgba(240,84,84,.25)' : '1px solid rgba(52,199,89,.25)',
+            }}>
+              {status?.key_source === 'none' ? 'No Key' : 'Active'}
+            </span>
+            <span style={{ fontSize: 12, color: 'var(--text2)' }}>
+              {srcLabel[status?.key_source] || 'Unknown'}
+            </span>
+            {status?.key_hint && (
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text3)' }}>
+                {status.key_hint}
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Key form — admin only */}
+        {role === 'admin' && (<>
+          <div style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 10, lineHeight: 1.6 }}>
+            Enter a key to override <code style={{ fontFamily:'var(--mono)', fontSize:11 }}>DEEPSEEK_API_KEY</code> from
+            watcher.conf. Leave blank to clear the override and fall back to the conf file.
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginBottom: msg ? 10 : 0 }}>
+            <input
+              type="password"
+              value={newKey}
+              onChange={e => setNewKey(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && saveKey()}
+              placeholder="sk-..."
+              style={{
+                flex: 1, background: 'var(--bg2)', border: '1px solid var(--border2)',
+                borderRadius: 'var(--radius-md)', padding: '6px 10px',
+                color: 'var(--text1)', fontFamily: 'var(--mono)', fontSize: 12,
+                outline: 'none',
+              }}
+            />
+            <button className="btn" onClick={saveKey} disabled={saving}
+              style={{ minWidth: 64, fontSize: 11 }}>
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+            {status?.key_source === 'db' && (
+              <button className="btn" onClick={clearKey}
+                style={{ fontSize: 11, background: 'rgba(240,84,84,.12)',
+                         color: 'var(--red)', border: '1px solid rgba(240,84,84,.25)' }}>
+                Clear
+              </button>
+            )}
+          </div>
+          {msg && (
+            <div style={{
+              fontSize: 11, fontFamily: 'var(--mono)', padding: '6px 10px',
+              borderRadius: 'var(--radius-md)', marginTop: 4,
+              background: msg.ok ? 'rgba(52,199,89,.08)' : 'rgba(240,84,84,.08)',
+              color:      msg.ok ? 'var(--green)'        : 'var(--red)',
+              border:     msg.ok ? '1px solid rgba(52,199,89,.2)' : '1px solid rgba(240,84,84,.2)',
+            }}>{msg.text}</div>
+          )}
+        </>)}
+
+        {role !== 'admin' && (
+          <div style={{ fontSize: 12, color: 'var(--text3)', fontFamily: 'var(--mono)' }}>
+            Only admins can manage the API key.
+          </div>
+        )}
+      </div>
+
+      <div className="wh-section" style={{ marginTop: 20 }}>
+        <div className="wh-section-title">How It Works</div>
+        <div className="wh-card">
+          <div style={{ fontSize: 12, color: 'var(--text2)', lineHeight: 1.75 }}>
+            Click <strong>Explain</strong> on any selected alert to get an AI-generated
+            analysis from DeepSeek. The explanation is cached by Signature ID so repeated
+            clicks on the same alert type are instant. Use <em>Regenerate</em> in the
+            dialog to force a fresh call.
+            <br/><br/>
+            Key priority: <span style={{ fontFamily:'var(--mono)', fontSize:11 }}>Settings UI → watcher.conf (DEEPSEEK_API_KEY)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function SettingsView({ currentUser, webhooks, onRefreshWebhooks, role }) {
   const [tab,      setTab]      = useState('users');
   const [triggerNew, setTriggerNew] = useState(false);
@@ -448,7 +584,7 @@ export function SettingsView({ currentUser, webhooks, onRefreshWebhooks, role })
         <div style={{ display:'flex', gap:1, background:'var(--bg2)',
                       border:'1px solid var(--border)', borderRadius:'var(--radius-sm)',
                       padding:2, marginLeft:10 }}>
-          {[{ id:'users', label:'Users' }, { id:'webhooks', label:'Webhooks' }, { id:'threat-intel', label:'Threat Intel' }, { id:'suppression', label:'Suppression' }].map(t => (
+          {[{ id:'users', label:'Users' }, { id:'webhooks', label:'Webhooks' }, { id:'threat-intel', label:'Threat Intel' }, { id:'suppression', label:'Suppression' }, { id:'ai-explain', label:'AI Explain' }].map(t => (
             <button key={t.id} onClick={() => setTab(t.id)} style={{
               padding:'2px 12px', borderRadius:'var(--radius-sm)', border:'none',
               background: tab===t.id ? 'var(--accent)' : 'transparent',
@@ -487,6 +623,9 @@ export function SettingsView({ currentUser, webhooks, onRefreshWebhooks, role })
         )}
         {tab === 'suppression' && (
           <SuppressionPanel role={role}/>
+        )}
+        {tab === 'ai-explain' && (
+          <AiExplainPanel role={role}/>
         )}
         {tab === 'users' && (<>
           <div className="wh-section">

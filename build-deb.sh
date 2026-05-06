@@ -39,6 +39,7 @@ Priority: optional
 Architecture: all
 Depends: python3 (>= 3.10)
 Maintainer: Watcher IDS <watcher@localhost>
+License: AGPL-3.0-or-later
 Description: Watcher IDS Dashboard
  Real-time Suricata IDS dashboard. Reads eve.json, streams alerts,
  tracks flows/DNS/HTTP, charts, webhooks, threat intel, suppression rules.

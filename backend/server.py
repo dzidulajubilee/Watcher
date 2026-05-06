@@ -42,6 +42,7 @@ from registry      import Registry
 from tail          import purge_thread, tail_thread
 from webhooks      import WebhookDB, delivery_worker
 from threat_intel  import ThreatIntelDB
+from explain       import ExplainDB, ExplainEngine
 from suppression   import SuppressionDB
 
 logging.basicConfig(
@@ -119,7 +120,9 @@ def main():
 
     # ── Webhook DB (uses config DB) ───────────────────────────────────────────
     wdb    = WebhookDB(conn_fn=cfg_db._conn)
-    ti_db  = ThreatIntelDB(conn_fn=cfg_db._conn)
+    ti_db       = ThreatIntelDB(conn_fn=cfg_db._conn)
+    explain_db  = ExplainDB(conn_fn=cfg_db._conn)
+    explain_eng = ExplainEngine(db=explain_db)
     sup_db = SuppressionDB(conn_fn=cfg_db._conn)
 
     # ── User manager — RBAC (uses config DB) ─────────────────────────────────
@@ -139,7 +142,8 @@ def main():
     Handler.auth     = auth
     Handler.registry = registry
     Handler.wdb      = wdb
-    Handler.ti_db    = ti_db
+    Handler.ti_db         = ti_db
+    Handler.explain_engine = explain_eng
     Handler.sup_db   = sup_db
     Handler.um       = um
     Handler.dns_db   = dns_db

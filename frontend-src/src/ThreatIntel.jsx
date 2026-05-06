@@ -7,20 +7,67 @@ const SEV_COLORS = {
 
 // ── ExplainDialog — pops up when user clicks Explain on a selected alert ──────
 export function ExplainDialog({ alert, role, onClose }) {
-  const [intel,   setIntel]   = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [editing, setEditing] = useState(false);
+  const [tab,       setTab]      = useState('ai');   // 'ai' | 'intel'
+  const [intel,     setIntel]    = useState(null);
+  const [intelLoad, setIntelLoad]= useState(true);
+  const [editing,   setEditing]  = useState(false);
 
+  // AI explanation state
+  const [aiData,    setAiData]   = useState(null);
+  const [aiLoading, setAiLoading]= useState(false);
+  const [aiError,   setAiError]  = useState(null);
+
+  // Fetch threat-intel (manual notes)
   useEffect(() => {
     if (!alert) return;
-    setLoading(true); setIntel(null); setEditing(false);
+    setIntelLoad(true); setIntel(null); setEditing(false);
     fetch(`/threat-intel/lookup?sig_id=${alert.sig_id}&category=${encodeURIComponent(alert.category || '')}`)
       .then(r => r.json())
-      .then(d => { setIntel(d && d.id ? d : null); setLoading(false); })
-      .catch(() => setLoading(false));
+      .then(d => { setIntel(d && d.id ? d : null); setIntelLoad(false); })
+      .catch(() => setIntelLoad(false));
   }, [alert?.sig_id, alert?.category]);
 
+  // Fetch AI explanation when AI tab is active
+  useEffect(() => {
+    if (!alert || tab !== 'ai') return;
+    // If we already have data for this alert, skip
+    if (aiData && aiData.sig_id === alert.sig_id) return;
+    fetchAi(false);
+  }, [alert?.sig_id, tab]);
+
+  function fetchAi(force) {
+    setAiLoading(true); setAiError(null);
+    fetch('/alerts/explain', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sig_id:   alert.sig_id,
+        sig_msg:  alert.sig_msg,
+        src_ip:   alert.src_ip,
+        dest_ip:  alert.dest_ip,
+        proto:    alert.proto,
+        category: alert.category,
+        severity: alert.severity,
+        force,
+      }),
+    })
+      .then(r => r.json())
+      .then(d => {
+        if (d.error) { setAiError(d.message || d.error); setAiLoading(false); return; }
+        setAiData(d); setAiLoading(false);
+      })
+      .catch(() => { setAiError('Network error — could not reach the server.'); setAiLoading(false); });
+  }
+
   if (!alert) return null;
+
+  const fmtAge = ts => {
+    const s = Math.floor(Date.now() / 1000 - ts);
+    if (s < 60)    return 'just now';
+    if (s < 3600)  return `${Math.floor(s/60)}m ago`;
+    if (s < 86400) return `${Math.floor(s/3600)}h ago`;
+    return `${Math.floor(s/86400)}d ago`;
+  };
 
   return (
     <div className="modal-bg" onClick={onClose}>
@@ -32,15 +79,15 @@ export function ExplainDialog({ alert, role, onClose }) {
       }}>
         {/* Header */}
         <div style={{
-          padding: '16px 20px', borderBottom: '1px solid var(--border)',
+          padding: '14px 20px', borderBottom: '1px solid var(--border)',
           display: 'flex', alignItems: 'flex-start', gap: 12, flexShrink: 0,
         }}>
           <div style={{
-            width: 36, height: 36, borderRadius: 'var(--radius-md)', flexShrink: 0,
+            width: 34, height: 34, borderRadius: 'var(--radius-md)', flexShrink: 0,
             background: 'var(--accent-d)', border: '1px solid rgba(79,156,249,.25)',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
           }}>
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
                  stroke="var(--accent)" strokeWidth="1.8">
               <circle cx="12" cy="12" r="10"/>
               <line x1="12" y1="8" x2="12" y2="12"/>
@@ -74,32 +121,133 @@ export function ExplainDialog({ alert, role, onClose }) {
           </button>
         </div>
 
-        {/* Body */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '18px 20px' }}>
-          {loading && (
-            <div style={{ color: 'var(--text3)', fontFamily: 'var(--mono)',
-                          fontSize: 12, textAlign: 'center', padding: '30px 0' }}>
-              Looking up intel…
-            </div>
-          )}
-
-          {!loading && intel && !editing && (
-            <IntelDisplay intel={intel} alert={alert} role={role}
-                          onEdit={() => setEditing(true)}/>
-          )}
-
-          {!loading && !intel && !editing && (
-            <NoIntel alert={alert} role={role} onAdd={() => setEditing(true)}/>
-          )}
-
-          {!loading && editing && (
-            <IntelEditor
-              alert={alert} existing={intel} role={role}
-              onSaved={d => { setIntel(d); setEditing(false); }}
-              onCancel={() => setEditing(false)}
-            />
-          )}
+        {/* Tabs */}
+        <div style={{
+          display: 'flex', gap: 0, borderBottom: '1px solid var(--border)',
+          padding: '0 20px', flexShrink: 0, background: 'var(--bg1)',
+        }}>
+          {[{ id:'ai', label:'AI Explanation' }, { id:'intel', label:'Threat Intel' }].map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)} style={{
+              background: 'none', border: 'none', padding: '8px 14px',
+              fontSize: 11, fontFamily: 'var(--mono)', cursor: 'pointer',
+              color:        tab === t.id ? 'var(--accent)'  : 'var(--text3)',
+              borderBottom: tab === t.id ? '2px solid var(--accent)' : '2px solid transparent',
+              marginBottom: -1, transition: 'color .15s',
+            }}>{t.label}</button>
+          ))}
         </div>
+
+        {/* AI Explanation tab */}
+        {tab === 'ai' && (
+          <div style={{ flex: 1, overflowY: 'auto', padding: '18px 20px' }}>
+            {aiLoading && (
+              <div style={{ color: 'var(--text3)', fontFamily: 'var(--mono)',
+                            fontSize: 12, textAlign: 'center', padding: '30px 0' }}>
+                <div style={{ marginBottom: 8 }}>Asking DeepSeek…</div>
+                <div style={{
+                  width: 24, height: 24, border: '2px solid var(--border2)',
+                  borderTopColor: 'var(--accent)', borderRadius: '50%',
+                  animation: 'spin .8s linear infinite', margin: '0 auto',
+                }}/>
+              </div>
+            )}
+
+            {!aiLoading && aiError && (
+              <div>
+                <div style={{
+                  background: 'rgba(240,84,84,.08)', border: '1px solid rgba(240,84,84,.2)',
+                  borderRadius: 'var(--radius-md)', padding: '12px 14px',
+                  color: 'var(--red)', fontSize: 12, lineHeight: 1.6, marginBottom: 12,
+                }}>
+                  {aiError.includes('no_key') || aiError.includes('API key')
+                    ? 'No DeepSeek API key configured. Add it in Settings → AI Explain.'
+                    : aiError}
+                </div>
+                <button className="btn" onClick={() => fetchAi(false)}
+                  style={{ fontSize: 11 }}>Retry</button>
+              </div>
+            )}
+
+            {!aiLoading && aiData && !aiError && (
+              <div>
+                {/* Meta row */}
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: 8,
+                  marginBottom: 14, flexWrap: 'wrap',
+                }}>
+                  <span style={{
+                    fontSize: 9, fontFamily: 'var(--mono)', letterSpacing: '.08em',
+                    textTransform: 'uppercase', padding: '2px 8px', borderRadius: 20,
+                    background: aiData.cached ? 'var(--bg3)' : 'rgba(79,156,249,.12)',
+                    color:      aiData.cached ? 'var(--text3)' : 'var(--accent)',
+                    border:     aiData.cached ? '1px solid var(--border)' : '1px solid rgba(79,156,249,.25)',
+                  }}>
+                    {aiData.cached ? 'Cached' : 'Fresh'}
+                  </span>
+                  <span style={{ fontSize: 10, color: 'var(--text3)', fontFamily: 'var(--mono)' }}>
+                    {fmtAge(aiData.generated_at)} · {aiData.model}
+                  </span>
+                  {(role === 'admin' || role === 'analyst') && (
+                    <button onClick={() => fetchAi(true)} style={{
+                      marginLeft: 'auto', background: 'none', border: 'none',
+                      color: 'var(--text3)', fontSize: 11, cursor: 'pointer',
+                      fontFamily: 'var(--mono)', padding: '2px 6px',
+                      borderRadius: 4, transition: 'color .15s',
+                    }} onMouseOver={e => e.target.style.color='var(--text1)'}
+                       onMouseOut={e  => e.target.style.color='var(--text3)'}>
+                      ↺ Regenerate
+                    </button>
+                  )}
+                </div>
+
+                {/* Explanation body */}
+                <div style={{
+                  fontSize: 12.5, lineHeight: 1.75, color: 'var(--text1)',
+                  whiteSpace: 'pre-wrap', fontFamily: 'var(--sans)',
+                }}>
+                  {aiData.explanation}
+                </div>
+
+                {/* Token usage */}
+                {(aiData.prompt_tokens > 0 || aiData.completion_tokens > 0) && (
+                  <div style={{
+                    marginTop: 16, paddingTop: 12,
+                    borderTop: '1px solid var(--border)',
+                    fontSize: 10, color: 'var(--text3)', fontFamily: 'var(--mono)',
+                  }}>
+                    {aiData.prompt_tokens} prompt + {aiData.completion_tokens} completion tokens
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Threat Intel tab */}
+        {tab === 'intel' && (
+          <div style={{ flex: 1, overflowY: 'auto', padding: '18px 20px' }}>
+            {intelLoad && (
+              <div style={{ color: 'var(--text3)', fontFamily: 'var(--mono)',
+                            fontSize: 12, textAlign: 'center', padding: '30px 0' }}>
+                Looking up intel…
+              </div>
+            )}
+            {!intelLoad && intel && !editing && (
+              <IntelDisplay intel={intel} alert={alert} role={role}
+                            onEdit={() => setEditing(true)}/>
+            )}
+            {!intelLoad && !intel && !editing && (
+              <NoIntel alert={alert} role={role} onAdd={() => setEditing(true)}/>
+            )}
+            {!intelLoad && editing && (
+              <IntelEditor
+                alert={alert} existing={intel} role={role}
+                onSaved={d => { setIntel(d); setEditing(false); }}
+                onCancel={() => setEditing(false)}
+              />
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

@@ -1,8 +1,9 @@
-# 👁 Watcher IDS Dashboard
+# Watcher IDS Dashboard
 
 A self-hosted, real-time intrusion detection dashboard for [Suricata](https://suricata.io).  
 Reads `eve.json`, streams live alerts, and presents everything in a fast single-page UI with no external dependencies at runtime.
 
+![Watcher screenshot placeholder](docs/screenshot.png)
 
 ---
 
@@ -139,7 +140,7 @@ Open the dashboard: `http://your-server:8765/`
 **Prerequisites:** Node.js 18+, `dpkg-deb`
 
 ```bash
-git clone https://github.com/dzidulajubilee/Watcher.git
+git clone https://github.com/yourname/watcher-ids.git
 cd watcher-ids
 ./build-deb.sh 1.1.0
 sudo apt install ./packaging/build/watcher-ids_1.1.0_all.deb
@@ -153,7 +154,7 @@ The build script installs npm dependencies, compiles the frontend with Vite, ass
 
 ```bash
 # Clone and install frontend deps once
-git clone https://github.com/dzidulajubilee/Watcher.git
+git clone https://github.com/yourname/watcher-ids.git
 cd watcher-ids
 cd frontend-src && npm install && npm run build && cd ..
 
@@ -315,10 +316,4 @@ The workflow installs Node, builds the frontend, assembles the `.deb`, and attac
 
 ## License
 
-AGPL — see [LICENSE](LICENSE) for details.
-
----
-
-<div align="center">
-<sub>Built for blue team ops. No cloud. No telemetry. Your data stays on your network.</sub>
-</div>
+AGPL-3.0 — see [LICENSE](LICENSE).

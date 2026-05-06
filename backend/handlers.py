@@ -75,7 +75,7 @@ class Handler(BaseHTTPRequestHandler):
         p = urlparse(self.path).path
         api = ("/alerts", "/flows", "/dns", "/http", "/events",
                "/health", "/charts", "/webhooks", "/users", "/me",
-               "/threat-intel", "/suppression")
+               "/threat-intel", "/suppression", "/settings")
         if p.startswith("/frontend/") and p not in self._PUBLIC:
             self._json({"error": "Unauthorized"}, 401)
         elif any(p.startswith(x) for x in api):
@@ -188,6 +188,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(self.ti_db.stats())
         elif path == "/suppression":
             self._json(self.sup_db.get_all())
+        elif path == "/settings/explain":
+            if not self._require_role("admin"): return
+            self._json({
+                "key_source": self.explain_engine.key_source(),
+                "key_hint":   self.explain_engine.key_hint(),
+            })
         elif path.startswith("/frontend/"):
             self._serve_static(path)
         else:
@@ -218,6 +224,8 @@ class Handler(BaseHTTPRequestHandler):
             self._ti_create()
         elif path == "/suppression":
             self._sup_create()
+        elif path == "/alerts/explain":
+            self._explain_get_or_create()
         else:
             self.send_error(404)
 
@@ -235,6 +243,8 @@ class Handler(BaseHTTPRequestHandler):
             self._ti_update(int(path.split("/")[2]))
         elif re.match(r"^/suppression/\d+$", path):
             self._sup_update(int(path.split("/")[2]))
+        elif path == "/settings/explain":
+            self._explain_settings_update()
         else:
             self.send_error(404)
 
@@ -613,3 +623,62 @@ class Handler(BaseHTTPRequestHandler):
                 break
 
         self.registry.remove(cid)
+
+    # ── AI Explain ────────────────────────────────────────────────────────────
+
+    def _explain_get_or_create(self):
+        """POST /alerts/explain — return cached or freshly generated explanation."""
+        if not self._require_auth(): return
+        body = self._read_json()
+        if body is None: return
+
+        sig_id = body.get("sig_id")
+        if not sig_id:
+            self._json({"error": "sig_id is required"}, 400); return
+
+        try:
+            sig_id = int(sig_id)
+        except (ValueError, TypeError):
+            self._json({"error": "sig_id must be an integer"}, 400); return
+
+        if not self.explain_engine.has_key():
+            self._json({"error": "no_key",
+                        "message": "No DeepSeek API key configured. "
+                                   "Add DEEPSEEK_API_KEY to watcher.conf "
+                                   "or set it in Settings → AI Explain."}, 503)
+            return
+
+        force = bool(body.get("force", False))
+        alert = {
+            "sig_id":   sig_id,
+            "sig_msg":  body.get("sig_msg", ""),
+            "src_ip":   body.get("src_ip", ""),
+            "dest_ip":  body.get("dest_ip", ""),
+            "proto":    body.get("proto", ""),
+            "category": body.get("category", ""),
+            "severity": body.get("severity", ""),
+        }
+
+        try:
+            result = self.explain_engine.explain(alert, force=force)
+            self._json(result)
+        except ValueError as e:
+            self._json({"error": str(e)}, 400)
+        except RuntimeError as e:
+            self._json({"error": str(e)}, 502)
+        except Exception as e:
+            log.exception("Unexpected error in explain")
+            self._json({"error": "Internal error"}, 500)
+
+    def _explain_settings_update(self):
+        """PUT /settings/explain — store or clear the DeepSeek API key override."""
+        if not self._require_role("admin"): return
+        body = self._read_json()
+        if body is None: return
+
+        api_key = body.get("api_key")  # None or "" clears the override
+        self.explain_engine.set_key(api_key if api_key else None)
+        self._json({
+            "key_source": self.explain_engine.key_source(),
+            "key_hint":   self.explain_engine.key_hint(),
+        })
