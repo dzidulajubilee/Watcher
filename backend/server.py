@@ -161,7 +161,8 @@ def main():
     threading.Thread(
         target=tail_thread,
         args=(args.eve, db, registry, wdb),
-        kwargs={"dns_db": dns_db, "sup_db": sup_db},
+        kwargs={"dns_db": dns_db, "sup_db": sup_db,
+                "explain_engine": explain_eng},
         daemon=True, name="tail",
     ).start()
 

@@ -14,7 +14,7 @@ export function ExplainDialog({ alert, role, onClose }) {
 
   // AI explanation state
   const [aiData,    setAiData]   = useState(null);
-  const [aiLoading, setAiLoading]= useState(false);
+  const [aiLoading, setAiLoading]= useState(true);
   const [aiError,   setAiError]  = useState(null);
 
   // Fetch threat-intel (manual notes)
@@ -27,13 +27,14 @@ export function ExplainDialog({ alert, role, onClose }) {
       .catch(() => setIntelLoad(false));
   }, [alert?.sig_id, alert?.category]);
 
-  // Fetch AI explanation when AI tab is active
+  // Fetch AI explanation immediately on open — backend has likely already cached it.
+  // We always try on mount so the summary is ready whether the user opens
+  // the AI tab first or the Intel tab first.
   useEffect(() => {
-    if (!alert || tab !== 'ai') return;
-    // If we already have data for this alert, skip
-    if (aiData && aiData.sig_id === alert.sig_id) return;
+    if (!alert) return;
+    if (aiData && aiData.sig_id === alert.sig_id) return; // already loaded
     fetchAi(false);
-  }, [alert?.sig_id, tab]);
+  }, [alert?.sig_id]);
 
   function fetchAi(force) {
     setAiLoading(true); setAiError(null);
@@ -143,7 +144,7 @@ export function ExplainDialog({ alert, role, onClose }) {
             {aiLoading && (
               <div style={{ color: 'var(--text3)', fontFamily: 'var(--mono)',
                             fontSize: 12, textAlign: 'center', padding: '30px 0' }}>
-                <div style={{ marginBottom: 8 }}>Asking DeepSeek…</div>
+                <div style={{ marginBottom: 8 }}>Loading summary…</div>
                 <div style={{
                   width: 24, height: 24, border: '2px solid var(--border2)',
                   borderTopColor: 'var(--accent)', borderRadius: '50%',
@@ -160,7 +161,7 @@ export function ExplainDialog({ alert, role, onClose }) {
                   color: 'var(--red)', fontSize: 12, lineHeight: 1.6, marginBottom: 12,
                 }}>
                   {aiError.includes('no_key') || aiError.includes('API key')
-                    ? 'No DeepSeek API key configured. Add it in Settings → AI Explain.'
+                    ? 'No DeepSeek API key configured. Summaries are generated automatically once a key is set in Settings → AI Explain.'
                     : aiError}
                 </div>
                 <button className="btn" onClick={() => fetchAi(false)}

@@ -23,7 +23,7 @@ log = logging.getLogger("watcher.explain")
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 DEEPSEEK_MODEL   = "deepseek-chat"
-MAX_TOKENS       = 700
+MAX_TOKENS       = 220
 
 
 # ── ExplainDB ─────────────────────────────────────────────────────────────────
@@ -167,34 +167,38 @@ class ExplainEngine:
 
     @staticmethod
     def _build_prompt(alert: dict) -> str:
+        """
+        Builds a prompt that returns a 3-sentence executive summary:
+          1. What triggered it.
+          2. Why it matters / threat context.
+          3. Recommended immediate action.
+        Designed to be skimmable in under 10 seconds by a SOC analyst.
+        """
         lines = [
-            "You are a network security analyst. Explain the following Suricata IDS "
-            "alert in plain language for a security operations team.",
+            "You are a senior SOC analyst writing for a security operations team.",
+            "Write a 3-sentence executive summary for the following Suricata IDS alert.",
             "",
-            f"Alert: {alert.get('sig_msg', 'Unknown')}",
-            f"SID: {alert.get('sig_id', 'N/A')}",
+            f"Alert : {alert.get('sig_msg', 'Unknown')}",
+            f"SID   : {alert.get('sig_id', 'N/A')}",
         ]
         if alert.get("category"):
-            lines.append(f"Category: {alert['category']}")
+            lines.append(f"Category : {alert['category']}")
         if alert.get("severity"):
-            lines.append(f"Severity: {alert['severity']}")
+            lines.append(f"Severity : {alert['severity']}")
         if alert.get("src_ip"):
-            lines.append(f"Source IP: {alert['src_ip']}")
+            lines.append(f"Source   : {alert['src_ip']}")
         if alert.get("dest_ip"):
-            lines.append(f"Destination IP: {alert['dest_ip']}")
+            lines.append(f"Dest     : {alert['dest_ip']}")
         if alert.get("proto"):
-            lines.append(f"Protocol: {alert['proto'].upper()}")
+            lines.append(f"Protocol : {alert['proto'].upper()}")
 
         lines += [
             "",
-            "Provide a concise explanation covering:",
-            "1. What triggered this alert",
-            "2. What the threat or attack type likely is",
-            "3. Severity assessment",
-            "4. Recommended immediate action",
-            "",
-            "Keep the response under 300 words. Use plain paragraphs only — "
-            "no markdown headers, no bullet symbols, no asterisks.",
+            "Rules:",
+            "- Sentence 1: what specifically triggered this alert.",
+            "- Sentence 2: the likely threat type and why it matters.",
+            "- Sentence 3: the single most important action the analyst should take right now.",
+            "- Output exactly 3 sentences, no headers, no bullets, no markdown.",
         ]
         return "\n".join(lines)
 

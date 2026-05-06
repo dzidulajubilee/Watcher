@@ -7,6 +7,7 @@ Background thread that tails eve.json and dispatches all event types:
 import json
 import logging
 import os
+import threading
 import time
 
 log = logging.getLogger("watcher.tail")
@@ -144,12 +145,19 @@ def _http_summary(evt: dict) -> dict:
     }
 
 
-def tail_thread(path: str, db, registry, wdb=None, dns_db=None, sup_db=None):
+def tail_thread(path: str, db, registry, wdb=None, dns_db=None, sup_db=None,
+               explain_engine=None):
     """
     Runs forever in a daemon thread.
     Tails eve.json, persists each event, and broadcasts SSE summaries.
     dns_db: DnsDB instance — if provided, DNS events go here instead of db.
+    explain_engine: optional ExplainEngine — auto-generates executive summaries
+      for new sig_ids in the background (one call per unique SID, cached).
     """
+    # Track which sig_ids we have already queued for auto-explain this session.
+    # On restart the DB cache is checked first, so this just avoids redundant
+    # thread spawns within a single run.
+    _explained_sids: set = set()
     log.info("Tailing %s", path)
 
     pos = 0
@@ -177,6 +185,10 @@ def tail_thread(path: str, db, registry, wdb=None, dns_db=None, sup_db=None):
                                 if wdb is not None:
                                     from webhooks import dispatch
                                     dispatch(parsed, wdb)
+                                # ── Auto-explain (background, per unique SID) ──
+                                if explain_engine is not None:
+                                    _auto_explain(parsed, explain_engine,
+                                                  _explained_sids)
 
                         elif etype == "flow":
                             db.insert_flow(parsed)
@@ -216,3 +228,36 @@ def purge_thread(db, auth, dns_db=None):
         auth.purge_expired()
         if dns_db is not None:
             dns_db.purge_old()
+
+def _auto_explain(alert: dict, engine, seen: set) -> None:
+    """
+    Fire-and-forget: spawn a daemon thread to generate an executive summary
+    for a new sig_id.  Skips immediately if:
+      - no API key is configured
+      - this sig_id was already queued this session
+      - the DB already has a cached explanation for this SID
+    """
+    sig_id = alert.get("sig_id")
+    if not sig_id or sig_id in seen:
+        return
+    if not engine.has_key():
+        return
+
+    # Mark as seen before spawning to prevent race on rapid duplicates
+    seen.add(sig_id)
+
+    def _worker():
+        try:
+            result = engine.explain(alert, force=False)
+            if result.get("cached"):
+                log.debug("Auto-explain SID %d: cache hit, skipped API call.", sig_id)
+            else:
+                log.info("Auto-explain SID %d: summary generated (%d tokens).",
+                         sig_id,
+                         result.get("prompt_tokens", 0) + result.get("completion_tokens", 0))
+        except Exception as exc:
+            log.warning("Auto-explain SID %d failed: %s", sig_id, exc)
+
+    t = threading.Thread(target=_worker, daemon=True,
+                         name=f"explain-{sig_id}")
+    t.start()
