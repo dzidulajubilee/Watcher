@@ -3,7 +3,6 @@
 A self-hosted, real-time intrusion detection dashboard for [Suricata](https://suricata.io).  
 Reads `eve.json`, streams live alerts, and presents everything in a fast single-page UI with no external dependencies at runtime.
 
-![Watcher screenshot placeholder](docs/screenshot.png)
 
 ---
 
