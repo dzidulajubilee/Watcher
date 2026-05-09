@@ -40,6 +40,9 @@ class AlertDB:
             c.row_factory = sqlite3.Row
             c.execute("PRAGMA journal_mode = WAL")
             c.execute("PRAGMA synchronous  = NORMAL")
+            c.execute("PRAGMA cache_size   = -8192")   # 8 MB page cache
+            c.execute("PRAGMA mmap_size    = 134217728")  # 128 MB mmap read
+            c.execute("PRAGMA temp_store   = MEMORY")  # temp tables in RAM
 
             c.execute("""CREATE TABLE IF NOT EXISTS alerts (
                 id TEXT PRIMARY KEY, ts TEXT NOT NULL, ts_epoch REAL NOT NULL,
@@ -49,10 +52,14 @@ class AlertDB:
                 ack_status TEXT NOT NULL DEFAULT 'new',
                 ack_note TEXT, ack_by TEXT, ack_at REAL)""")
 
-            c.execute("CREATE INDEX IF NOT EXISTS idx_a_ts     ON alerts (ts_epoch)")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_a_sev    ON alerts (severity)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_a_ts      ON alerts (ts_epoch)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_a_sev     ON alerts (severity)")
             # Composite: accelerates time-range + severity filters together
-            c.execute("CREATE INDEX IF NOT EXISTS idx_a_ts_sev ON alerts (ts_epoch, severity)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_a_ts_sev  ON alerts (ts_epoch, severity)")
+            # sig_id: used by top_sids() GROUP BY and auto-explain lookup
+            c.execute("CREATE INDEX IF NOT EXISTS idx_a_sig_id  ON alerts (sig_id)")
+            # ack_status: used by bulk-ack filters and status views
+            c.execute("CREATE INDEX IF NOT EXISTS idx_a_ack     ON alerts (ack_status)")
 
             # Migration: add ack columns to existing databases
             alert_cols = {r[1] for r in c.execute("PRAGMA table_info(alerts)").fetchall()}
@@ -136,23 +143,49 @@ class AlertDB:
         except sqlite3.Error as e:
             log.warning("DB insert (alert): %s", e)
 
-    def fetch_recent(self, days=None, limit=5000):
+    def fetch_recent(self, days=None, limit=5000, include_raw=False):
+        """
+        Fetch recent alerts.  raw_json is expensive to deserialize for thousands
+        of rows — it is omitted by default and only returned when include_raw=True
+        (used by the single-alert raw detail view).
+        """
         cutoff = time.time() - (days or self.retain_days) * 86400
-        rows = self._conn().execute(
-            """SELECT id,ts,src_ip,src_port,dst_ip,dst_port,proto,iface,
-                      flow_id,sig_id,sig_msg,category,severity,action,raw_json,
-                      ack_status,ack_note,ack_by,ack_at
-               FROM alerts WHERE ts_epoch>=? ORDER BY ts_epoch DESC LIMIT ?""",
-            (cutoff, limit)).fetchall()
-        result = []
-        for row in rows:
-            d = dict(row)
-            try:
-                d["raw"] = json.loads(d.pop("raw_json", "{}"))
-            except Exception:
-                d["raw"] = {}
-            result.append(d)
-        return result
+        if include_raw:
+            rows = self._conn().execute(
+                """SELECT id,ts,src_ip,src_port,dst_ip,dst_port,proto,iface,
+                          flow_id,sig_id,sig_msg,category,severity,action,raw_json,
+                          ack_status,ack_note,ack_by,ack_at
+                   FROM alerts WHERE ts_epoch>=? ORDER BY ts_epoch DESC LIMIT ?""",
+                (cutoff, limit)).fetchall()
+            result = []
+            for row in rows:
+                d = dict(row)
+                try:
+                    d["raw"] = json.loads(d.pop("raw_json", "{}"))
+                except Exception:
+                    d["raw"] = {}
+                result.append(d)
+            return result
+        else:
+            rows = self._conn().execute(
+                """SELECT id,ts,src_ip,src_port,dst_ip,dst_port,proto,iface,
+                          flow_id,sig_id,sig_msg,category,severity,action,
+                          ack_status,ack_note,ack_by,ack_at
+                   FROM alerts WHERE ts_epoch>=? ORDER BY ts_epoch DESC LIMIT ?""",
+                (cutoff, limit)).fetchall()
+            return [dict(r) for r in rows]
+
+    def fetch_raw(self, alert_id: str) -> dict | None:
+        """Return the raw_json blob for a single alert — used by the detail Raw tab."""
+        row = self._conn().execute(
+            "SELECT raw_json FROM alerts WHERE id=?", (alert_id,)
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row[0] or "{}")
+        except Exception:
+            return {}
 
     # ── Flows ─────────────────────────────────────────────────────────────────
 

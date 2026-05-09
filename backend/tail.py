@@ -10,6 +10,8 @@ import os
 import threading
 import time
 
+from webhooks import dispatch as _webhook_dispatch
+
 log = logging.getLogger("watcher.tail")
 
 _SEVERITY_MAP = {
@@ -183,8 +185,7 @@ def tail_thread(path: str, db, registry, wdb=None, dns_db=None, sup_db=None,
                                 db.insert(parsed)
                                 registry.broadcast("alert", parsed)
                                 if wdb is not None:
-                                    from webhooks import dispatch
-                                    dispatch(parsed, wdb)
+                                    _webhook_dispatch(parsed, wdb)
                                 # ── Auto-explain (background, per unique SID) ──
                                 if explain_engine is not None:
                                     _auto_explain(parsed, explain_engine,

@@ -53,6 +53,7 @@ chmod 755 "${BUILD}/DEBIAN/postinst" "${BUILD}/DEBIAN/prerm" "${BUILD}/DEBIAN/po
 
 # ── 4. Backend Python files ───────────────────────────────────────────────────
 cp "${ROOT}/backend/"*.py "${BUILD}/opt/watcher/"
+cp "${ROOT}/LICENSE"       "${BUILD}/opt/watcher/LICENSE"
 
 # Install-time config.py — overwrite with hardcoded system paths
 cat > "${BUILD}/opt/watcher/config.py" << 'PYEOF'

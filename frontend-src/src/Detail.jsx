@@ -9,6 +9,9 @@ export function Detail({ alert, onAck, role }) {
   const [tab,         setTab]         = useState('details');
   const [history,     setHistory]     = useState([]);
   const [histLoading, setHistLoading] = useState(false);
+  // Raw JSON is lazy-fetched when the Raw tab is opened (not on every alert load)
+  const [rawJson,     setRawJson]     = useState(null);
+  const [rawLoading,  setRawLoading]  = useState(false);
 
   useEffect(() => {
     setAckStatus(alert?.ack_status || 'new');
@@ -16,6 +19,7 @@ export function Detail({ alert, onAck, role }) {
     setSaveMsg('');
     setTab('details');
     setHistory([]);
+    setRawJson(null);
   }, [alert?.id]);
 
   useEffect(() => {
@@ -25,6 +29,16 @@ export function Detail({ alert, onAck, role }) {
       .then(r => r.json())
       .then(d => { setHistory(Array.isArray(d) ? d : []); setHistLoading(false); })
       .catch(() => setHistLoading(false));
+  }, [tab, alert?.id]);
+
+  // Lazy-fetch raw EVE JSON only when Raw tab is first opened
+  useEffect(() => {
+    if (tab !== 'raw' || !alert || rawJson !== null) return;
+    setRawLoading(true);
+    fetch(`/alerts/${alert.id}/raw`)
+      .then(r => r.json())
+      .then(d => { setRawJson(d); setRawLoading(false); })
+      .catch(() => { setRawJson(alert.raw || {}); setRawLoading(false); });
   }, [tab, alert?.id]);
 
   async function submitAck() {
@@ -252,11 +266,14 @@ export function Detail({ alert, onAck, role }) {
         </div>
       )}
 
-      {/* ── Raw JSON ── */}
+      {/* ── Raw JSON (lazy-fetched on tab open) ── */}
       {tab === 'raw' && (
         <div className="dscroll">
           <div className="dsec-title" style={{ marginBottom:8 }}>Raw EVE JSON</div>
-          <HighlightedJSON data={alert.raw || alert} />
+          {rawLoading
+            ? <div style={{ color:'var(--text3)', fontFamily:'var(--mono)',
+                            fontSize:11, padding:'20px 0', textAlign:'center' }}>Loading…</div>
+            : <HighlightedJSON data={rawJson ?? alert.raw ?? alert} />}
         </div>
       )}
     </div>

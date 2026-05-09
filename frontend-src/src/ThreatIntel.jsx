@@ -9,7 +9,7 @@ const SEV_COLORS = {
 const PROVIDER_COLOR = { deepseek: '#4D6BFE', openai: '#10A37F', anthropic: '#D4793B' };
 
 // ── ExplainDialog — pops up when user clicks Explain on a selected alert ──────
-export function ExplainDialog({ alert, role, onClose }) {
+export function ExplainDialog({ alert, role, aiEnabled: aiEnabledProp, onClose }) {
   const [aiEnabled, setAiEnabled] = useState(null);  // null = loading
   const [tab,       setTab]       = useState(null);   // set after config loaded
   const [intel,     setIntel]     = useState(null);
@@ -21,17 +21,13 @@ export function ExplainDialog({ alert, role, onClose }) {
   const [aiLoading, setAiLoading] = useState(true);
   const [aiError,   setAiError]   = useState(null);
 
-  // On open: check AI enabled status, then set default tab
+  // Use the aiEnabled prop passed from App (fetched once at app level — no per-click fetch)
   useEffect(() => {
-    if (!alert) return;
-    fetch('/settings/explain')
-      .then(r => r.json())
-      .then(d => {
-        setAiEnabled(d.enabled);
-        setTab(d.enabled ? 'ai' : 'intel');
-      })
-      .catch(() => { setAiEnabled(false); setTab('intel'); });
-  }, [alert?.sig_id]);
+    if (alert === null) return;
+    const enabled = aiEnabledProp ?? false;
+    setAiEnabled(enabled);
+    setTab(enabled ? 'ai' : 'intel');
+  }, [alert?.sig_id, aiEnabledProp]);
 
   // Fetch threat-intel notes
   useEffect(() => {

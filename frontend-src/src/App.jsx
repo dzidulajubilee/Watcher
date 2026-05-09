@@ -42,11 +42,15 @@ export default function App() {
   const [bulkNote,     setBulkNote]     = useState('');
   const [bulkSaving,   setBulkSaving]   = useState(false);
   const [showExplain,  setShowExplain]  = useState(false);
+  // AI enabled state — fetched once, passed to ExplainDialog (avoids per-click fetch)
+  const [aiEnabled,    setAiEnabled]    = useState(null);
 
-  const pausedRef   = useRef(false);
-  const accumRef    = useRef(0);
-  const sparkIdxRef = useRef(0);
-  const newIdsRef   = useRef(new Set());
+  const pausedRef    = useRef(false);
+  const accumRef     = useRef(0);
+  const sparkIdxRef  = useRef(0);
+  const newIdsRef    = useRef(new Set());
+  // O(1) dedup Set — avoids O(n) prev.some() scan on every SSE alert event
+  const alertIdsRef  = useRef(new Set());
 
   // ── Theme ──────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -69,6 +73,11 @@ export default function App() {
       setCurrentUser(d.username || '');
       setRole(d.role || 'admin');
     }).catch(() => {});
+    // Fetch AI enabled status once — passed down to ExplainDialog
+    fetch('/settings/explain')
+      .then(r => r.json())
+      .then(d => setAiEnabled(d.enabled ?? true))
+      .catch(() => setAiEnabled(false));
   }, []);
 
   // ── Load alert history ─────────────────────────────────────────────────────
@@ -81,6 +90,7 @@ export default function App() {
       .then(rows => {
         if (!Array.isArray(rows)) return;
         const loaded = rows.map(r => ({ ...r, tsStr: fmtTime(r.ts) }));
+        alertIdsRef.current = new Set(loaded.map(r => r.id));
         setAlerts(loaded);
         setHistoryCount(loaded.length);
       })
@@ -124,11 +134,16 @@ export default function App() {
           accumRef.current++;
           newIdsRef.current.add(evt.id);
           setTimeout(() => newIdsRef.current.delete(evt.id), 400);
+          if (alertIdsRef.current.has(evt.id)) return;
+          alertIdsRef.current.add(evt.id);
           setAlerts(prev => {
-            if (prev.length > 0 && prev[0].id === evt.id) return prev;
-            if (prev.some(x => x.id === evt.id)) return prev;
             const next = [evt, ...prev];
-            return next.length > MAX_ALERTS ? next.slice(0, MAX_ALERTS) : next;
+            if (next.length > MAX_ALERTS) {
+              // Drop oldest — also remove from dedup set
+              alertIdsRef.current.delete(next[next.length - 1].id);
+              return next.slice(0, MAX_ALERTS);
+            }
+            return next;
           });
         } catch {}
       });
@@ -755,6 +770,7 @@ export default function App() {
         <ExplainDialog
           alert={selected}
           role={role}
+          aiEnabled={aiEnabled}
           onClose={() => setShowExplain(false)}
         />
       )}

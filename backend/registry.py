@@ -54,17 +54,24 @@ class Registry:
         Serialize `payload` as an SSE event and enqueue it for
         every connected client.  Clients whose queues are full are dropped.
         event_type: 'alert' | 'flow' | 'dns' | 'http' | 'ping'
+
+        JSON serialization is done BEFORE acquiring the lock so that
+        json.dumps() time does not block add()/remove() callers.
         """
         msg = f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
+        # Snapshot client list without holding lock during iteration
         with self._lock:
-            dead = []
-            for cid, q in self._clients.items():
-                try:
-                    q.put_nowait(msg)
-                except Exception:
-                    dead.append(cid)
-            for cid in dead:
-                self._clients.pop(cid, None)
+            clients = list(self._clients.items())
+        dead = []
+        for cid, q in clients:
+            try:
+                q.put_nowait(msg)
+            except Exception:
+                dead.append(cid)
+        if dead:
+            with self._lock:
+                for cid in dead:
+                    self._clients.pop(cid, None)
 
     # ── Info ──────────────────────────────────────────────────────────────────
 

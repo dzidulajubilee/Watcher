@@ -26,6 +26,9 @@ class Handler(BaseHTTPRequestHandler):
     dns_db   = None
     ti_db    = None
     sup_db   = None
+    explain_engine  = None
+    # Stats cache: (data, expires_at) — avoids 7 DB queries on every /health poll
+    _stats_cache: "tuple | None" = None
 
     server_version = ""
     sys_version    = ""
@@ -163,6 +166,12 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_charts(qs)
         elif re.match(r"^/alerts/[^/]+/ack/history$", path):
             self._json(self.db.fetch_ack_history(path.split("/")[2]))
+        elif re.match(r"^/alerts/[^/]+/raw$", path):
+            raw = self.db.fetch_raw(path.split("/")[2])
+            if raw is None:
+                self.send_error(404)
+            else:
+                self._json(raw)
         elif path == "/webhooks":
             self._json(self.wdb.get_all())
         elif path == "/me":
@@ -172,8 +181,14 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_role("admin"): return
             self._json(self.um.get_all())
         elif path == "/health":
-            self._json({"status": "ok", "clients": self.registry.count(),
-                        "db": self.db.stats(), "time": int(time.time())})
+            now = time.time()
+            if (Handler._stats_cache is None or
+                    Handler._stats_cache[1] < now):
+                Handler._stats_cache = (self.db.stats(), now + 5)
+            self._json({"status": "ok",
+                        "clients": self.registry.count(),
+                        "db":      Handler._stats_cache[0],
+                        "time":    int(now)})
         elif path == "/threat-intel":
             self._json(self.ti_db.get_all())
         elif path == "/threat-intel/lookup":
