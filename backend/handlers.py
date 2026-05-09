@@ -189,11 +189,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/suppression":
             self._json(self.sup_db.get_all())
         elif path == "/settings/explain":
-            if not self._require_role("admin"): return
-            self._json({
-                "key_source": self.explain_engine.key_source(),
-                "key_hint":   self.explain_engine.key_hint(),
-            })
+            if not self._require_auth(): return
+            self._json(self.explain_engine.get_config())
         elif path.startswith("/frontend/"):
             self._serve_static(path)
         else:
@@ -671,14 +668,19 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "Internal error"}, 500)
 
     def _explain_settings_update(self):
-        """PUT /settings/explain — store or clear the DeepSeek API key override."""
+        """PUT /settings/explain — update enabled, provider, or api_key."""
         if not self._require_role("admin"): return
         body = self._read_json()
         if body is None: return
 
-        api_key = body.get("api_key")  # None or "" clears the override
-        self.explain_engine.set_key(api_key if api_key else None)
-        self._json({
-            "key_source": self.explain_engine.key_source(),
-            "key_hint":   self.explain_engine.key_hint(),
-        })
+        enabled         = body.get("enabled")           # bool or None
+        provider        = body.get("provider")          # str or None
+        api_key         = body.get("api_key")           # str or None
+        target_provider = body.get("target_provider")  # str or None
+
+        self._json(self.explain_engine.set_config(
+            enabled         = enabled,
+            provider        = provider if provider else None,
+            api_key         = api_key,
+            target_provider = target_provider,
+        ))

@@ -408,137 +408,223 @@ function WebhooksView({ webhooks, onRefresh, triggerNew }) {
 
 // ── SettingsView ──────────────────────────────────────────────────────────────
 // ── AiExplainPanel ────────────────────────────────────────────────────────────
+const PROVIDER_META = {
+  deepseek:  { label: 'DeepSeek',          color: '#4D6BFE', model: 'deepseek-chat',              site: 'platform.deepseek.com/api_keys' },
+  openai:    { label: 'OpenAI',            color: '#10A37F', model: 'gpt-4o-mini',                 site: 'platform.openai.com/api-keys'   },
+  anthropic: { label: 'Anthropic (Claude)', color: '#D4793B', model: 'claude-haiku-4-5-20251001', site: 'console.anthropic.com/settings/keys' },
+};
+
 function AiExplainPanel({ role }) {
-  const [status,  setStatus]  = useState(null);   // { key_source, key_hint }
+  const [cfg,     setCfg]     = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving,  setSaving]  = useState(false);
-  const [newKey,  setNewKey]  = useState('');
+  const [keyInputs, setKeyInputs] = useState({ deepseek: '', openai: '', anthropic: '' });
   const [msg,     setMsg]     = useState(null);   // { text, ok }
 
   useEffect(() => {
     fetch('/settings/explain')
       .then(r => r.json())
-      .then(d => { setStatus(d); setLoading(false); })
+      .then(d => { setCfg(d); setLoading(false); })
       .catch(() => setLoading(false));
   }, []);
 
-  async function saveKey() {
+  async function save(patch) {
     setSaving(true); setMsg(null);
     const res = await fetch('/settings/explain', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ api_key: newKey.trim() || null }),
+      body: JSON.stringify(patch),
     }).then(r => r.json()).catch(() => null);
     setSaving(false);
     if (!res) { setMsg({ text: 'Save failed — network error.', ok: false }); return; }
-    setStatus(res);
-    setNewKey('');
-    setMsg({ text: newKey.trim()
-      ? `Key saved (${res.key_hint}). Source: ${res.key_source}.`
-      : 'Key cleared. Falling back to watcher.conf env var.', ok: true });
+    setCfg(res);
+    return res;
   }
 
-  function clearKey() { setNewKey(''); saveKey(); }
+  async function toggleEnabled() {
+    const res = await save({ enabled: !cfg.enabled });
+    if (res) setMsg({ text: res.enabled ? 'AI explanations enabled.' : 'AI explanations disabled.', ok: true });
+  }
+
+  async function switchProvider(pid) {
+    const res = await save({ provider: pid });
+    if (res) setMsg({ text: `Switched to ${PROVIDER_META[pid].label}.`, ok: true });
+  }
+
+  async function saveKey(pid) {
+    const key = keyInputs[pid].trim();
+    const res = await save({ api_key: key || null, target_provider: pid });
+    if (res) {
+      setKeyInputs(prev => ({ ...prev, [pid]: '' }));
+      setMsg({ text: key ? `Key saved for ${PROVIDER_META[pid].label}.` : `Key cleared for ${PROVIDER_META[pid].label}.`, ok: true });
+    }
+  }
 
   if (loading) return (
-    <div style={{ padding: 24, color: 'var(--text3)', fontFamily: 'var(--mono)', fontSize: 12 }}>
-      Loading…
-    </div>
+    <div style={{ padding: 24, color: 'var(--text3)', fontFamily: 'var(--mono)', fontSize: 12 }}>Loading…</div>
   );
 
-  const srcLabel = { db: 'Settings UI (DB override)', env: 'watcher.conf (DEEPSEEK_API_KEY)', none: 'Not configured' };
-
   return (
-    <div style={{ padding: 20, maxWidth: 560 }}>
+    <div style={{ padding: 20, maxWidth: 580, display: 'flex', flexDirection: 'column', gap: 20 }}>
+
+      {/* ── Enable / Disable toggle ── */}
       <div className="wh-section">
-        <div className="wh-section-title">DeepSeek API Key</div>
-
-        {/* Current status */}
-        <div className="wh-card" style={{ marginBottom: 16 }}>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-            <span style={{
-              fontSize: 9, fontFamily: 'var(--mono)', letterSpacing: '.08em',
-              textTransform: 'uppercase', padding: '2px 8px', borderRadius: 20,
-              background: status?.key_source === 'none' ? 'rgba(240,84,84,.1)' : 'rgba(52,199,89,.1)',
-              color:      status?.key_source === 'none' ? 'var(--red)'         : 'var(--green)',
-              border:     status?.key_source === 'none' ? '1px solid rgba(240,84,84,.25)' : '1px solid rgba(52,199,89,.25)',
+        <div className="wh-section-title">AI Explanations</div>
+        <div className="wh-card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text1)', marginBottom: 3 }}>
+              {cfg.enabled ? 'Enabled' : 'Disabled'}
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text3)', fontFamily: 'var(--mono)' }}>
+              {cfg.enabled
+                ? 'Summaries generated automatically on new alerts. Explain tab visible.'
+                : 'No summaries generated. AI Explanation tab hidden in alert dialog.'}
+            </div>
+          </div>
+          {role === 'admin' && (
+            <button onClick={toggleEnabled} disabled={saving} style={{
+              flexShrink: 0, marginLeft: 20,
+              width: 48, height: 26, borderRadius: 13,
+              border: 'none', cursor: 'pointer', transition: 'background .2s',
+              background: cfg.enabled ? 'var(--accent)' : 'var(--bg3)',
+              position: 'relative',
             }}>
-              {status?.key_source === 'none' ? 'No Key' : 'Active'}
-            </span>
-            <span style={{ fontSize: 12, color: 'var(--text2)' }}>
-              {srcLabel[status?.key_source] || 'Unknown'}
-            </span>
-            {status?.key_hint && (
-              <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text3)' }}>
-                {status.key_hint}
-              </span>
-            )}
-          </div>
-        </div>
-
-        {/* Key form — admin only */}
-        {role === 'admin' && (<>
-          <div style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 10, lineHeight: 1.6 }}>
-            Enter a key to override <code style={{ fontFamily:'var(--mono)', fontSize:11 }}>DEEPSEEK_API_KEY</code> from
-            watcher.conf. Leave blank to clear the override and fall back to the conf file.
-          </div>
-          <div style={{ display: 'flex', gap: 8, marginBottom: msg ? 10 : 0 }}>
-            <input
-              type="password"
-              value={newKey}
-              onChange={e => setNewKey(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && saveKey()}
-              placeholder="sk-..."
-              style={{
-                flex: 1, background: 'var(--bg2)', border: '1px solid var(--border2)',
-                borderRadius: 'var(--radius-md)', padding: '6px 10px',
-                color: 'var(--text1)', fontFamily: 'var(--mono)', fontSize: 12,
-                outline: 'none',
-              }}
-            />
-            <button className="btn" onClick={saveKey} disabled={saving}
-              style={{ minWidth: 64, fontSize: 11 }}>
-              {saving ? 'Saving…' : 'Save'}
+              <span style={{
+                position: 'absolute', top: 3,
+                left: cfg.enabled ? 26 : 4,
+                width: 20, height: 20, borderRadius: '50%',
+                background: 'white', transition: 'left .2s',
+                boxShadow: '0 1px 3px rgba(0,0,0,.3)',
+              }}/>
             </button>
-            {status?.key_source === 'db' && (
-              <button className="btn" onClick={clearKey}
-                style={{ fontSize: 11, background: 'rgba(240,84,84,.12)',
-                         color: 'var(--red)', border: '1px solid rgba(240,84,84,.25)' }}>
-                Clear
-              </button>
-            )}
-          </div>
-          {msg && (
-            <div style={{
-              fontSize: 11, fontFamily: 'var(--mono)', padding: '6px 10px',
-              borderRadius: 'var(--radius-md)', marginTop: 4,
-              background: msg.ok ? 'rgba(52,199,89,.08)' : 'rgba(240,84,84,.08)',
-              color:      msg.ok ? 'var(--green)'        : 'var(--red)',
-              border:     msg.ok ? '1px solid rgba(52,199,89,.2)' : '1px solid rgba(240,84,84,.2)',
-            }}>{msg.text}</div>
           )}
-        </>)}
-
-        {role !== 'admin' && (
-          <div style={{ fontSize: 12, color: 'var(--text3)', fontFamily: 'var(--mono)' }}>
-            Only admins can manage the API key.
-          </div>
-        )}
+        </div>
       </div>
 
-      <div className="wh-section" style={{ marginTop: 20 }}>
+      {/* ── Provider selector ── */}
+      <div className="wh-section">
+        <div className="wh-section-title">AI Provider</div>
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          {Object.entries(PROVIDER_META).map(([pid, pm]) => {
+            const pStatus  = cfg.providers?.[pid] || {};
+            const isActive = cfg.provider === pid;
+            const hasKey   = pStatus.key_source !== 'none';
+            return (
+              <div key={pid} onClick={() => role === 'admin' && switchProvider(pid)} style={{
+                flex: '1 1 160px', padding: '14px 16px',
+                borderRadius: 'var(--radius-md)',
+                border: `1px solid ${isActive ? pm.color + '66' : 'var(--border)'}`,
+                background: isActive ? pm.color + '11' : 'var(--bg2)',
+                cursor: role === 'admin' ? 'pointer' : 'default',
+                transition: 'all .15s', position: 'relative',
+              }}>
+                {isActive && (
+                  <div style={{
+                    position: 'absolute', top: 8, right: 8,
+                    width: 8, height: 8, borderRadius: '50%',
+                    background: pm.color,
+                  }}/>
+                )}
+                <div style={{ fontSize: 12, fontWeight: 600, color: isActive ? pm.color : 'var(--text1)', marginBottom: 4 }}>
+                  {pm.label}
+                </div>
+                <div style={{ fontSize: 10, fontFamily: 'var(--mono)', color: 'var(--text3)', marginBottom: 6 }}>
+                  {pm.model}
+                </div>
+                <span style={{
+                  fontSize: 9, fontFamily: 'var(--mono)', padding: '2px 7px',
+                  borderRadius: 10, letterSpacing: '.06em', textTransform: 'uppercase',
+                  background: hasKey ? 'rgba(52,199,89,.1)' : 'rgba(240,84,84,.1)',
+                  color:      hasKey ? 'var(--green)'       : 'var(--red)',
+                  border:     hasKey ? '1px solid rgba(52,199,89,.25)' : '1px solid rgba(240,84,84,.25)',
+                }}>
+                  {hasKey ? `Key set · ${pStatus.key_hint}` : 'No key'}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* ── Per-provider key management ── */}
+      {role === 'admin' && (
+        <div className="wh-section">
+          <div className="wh-section-title">API Keys</div>
+          {Object.entries(PROVIDER_META).map(([pid, pm]) => {
+            const pStatus = cfg.providers?.[pid] || {};
+            const hasKey  = pStatus.key_source !== 'none';
+            return (
+              <div key={pid} className="wh-card" style={{ marginBottom: 10 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text1)' }}>{pm.label}</span>
+                  {hasKey && (
+                    <span style={{ fontSize: 10, fontFamily: 'var(--mono)', color: 'var(--text3)' }}>
+                      {pStatus.key_source === 'env' ? 'from watcher.conf' : pStatus.key_hint}
+                    </span>
+                  )}
+                </div>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <input
+                    type="password"
+                    value={keyInputs[pid]}
+                    onChange={e => setKeyInputs(prev => ({ ...prev, [pid]: e.target.value }))}
+                    onKeyDown={e => e.key === 'Enter' && saveKey(pid)}
+                    placeholder={hasKey ? 'Enter new key to replace…' : `${pm.label} API key…`}
+                    style={{
+                      flex: 1, background: 'var(--bg2)', border: '1px solid var(--border2)',
+                      borderRadius: 'var(--radius-md)', padding: '6px 10px',
+                      color: 'var(--text1)', fontFamily: 'var(--mono)', fontSize: 11, outline: 'none',
+                    }}
+                  />
+                  <button className="btn" onClick={() => saveKey(pid)} disabled={saving || !keyInputs[pid].trim()}
+                    style={{ fontSize: 11, minWidth: 52, opacity: keyInputs[pid].trim() ? 1 : 0.4 }}>
+                    Save
+                  </button>
+                  {hasKey && pStatus.key_source === 'db' && (
+                    <button onClick={() => save({ api_key: '', target_provider: pid }).then(r => r && setMsg({ text: `Key cleared for ${pm.label}.`, ok: true }))}
+                      style={{
+                        background: 'rgba(240,84,84,.1)', border: '1px solid rgba(240,84,84,.25)',
+                        color: 'var(--red)', borderRadius: 'var(--radius-md)', padding: '6px 10px',
+                        fontSize: 11, cursor: 'pointer',
+                      }}>
+                      Clear
+                    </button>
+                  )}
+                </div>
+                <div style={{ fontSize: 10, color: 'var(--text3)', marginTop: 6 }}>
+                  Get key: <a href={`https://${pm.site}`} target="_blank" rel="noreferrer"
+                    style={{ color: 'var(--accent)', textDecoration: 'none' }}>{pm.site}</a>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* ── Info ── */}
+      <div className="wh-section">
         <div className="wh-section-title">How It Works</div>
         <div className="wh-card">
           <div style={{ fontSize: 12, color: 'var(--text2)', lineHeight: 1.75 }}>
-            Click <strong>Explain</strong> on any selected alert to get an AI-generated
-            analysis from DeepSeek. The explanation is cached by Signature ID so repeated
-            clicks on the same alert type are instant. Use <em>Regenerate</em> in the
-            dialog to force a fresh call.
+            When enabled, each unique Suricata signature triggers a background call to the
+            active provider — generating a 3-sentence executive summary cached by SID.
+            Click <strong>Explain</strong> on any alert to read it instantly.
+            Use <em>Regenerate</em> in the dialog to force a fresh call.
             <br/><br/>
-            Key priority: <span style={{ fontFamily:'var(--mono)', fontSize:11 }}>Settings UI → watcher.conf (DEEPSEEK_API_KEY)</span>
+            Key priority: <span style={{ fontFamily: 'var(--mono)', fontSize: 10 }}>Settings UI (DB) → watcher.conf (env var)</span>
           </div>
         </div>
       </div>
+
+      {msg && (
+        <div style={{
+          fontSize: 11, fontFamily: 'var(--mono)', padding: '8px 12px',
+          borderRadius: 'var(--radius-md)',
+          background: msg.ok ? 'rgba(52,199,89,.08)' : 'rgba(240,84,84,.08)',
+          color:      msg.ok ? 'var(--green)'        : 'var(--red)',
+          border:     msg.ok ? '1px solid rgba(52,199,89,.2)' : '1px solid rgba(240,84,84,.2)',
+        }}>{msg.text}</div>
+      )}
     </div>
   );
 }

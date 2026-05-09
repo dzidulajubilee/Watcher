@@ -5,19 +5,35 @@ const SEV_COLORS = {
   medium: 'var(--yellow)', low: 'var(--green)', info: 'var(--accent)',
 };
 
+// ── provider accent colours (mirrors Settings.jsx PROVIDER_META) ─────────────
+const PROVIDER_COLOR = { deepseek: '#4D6BFE', openai: '#10A37F', anthropic: '#D4793B' };
+
 // ── ExplainDialog — pops up when user clicks Explain on a selected alert ──────
 export function ExplainDialog({ alert, role, onClose }) {
-  const [tab,       setTab]      = useState('ai');   // 'ai' | 'intel'
-  const [intel,     setIntel]    = useState(null);
-  const [intelLoad, setIntelLoad]= useState(true);
-  const [editing,   setEditing]  = useState(false);
+  const [aiEnabled, setAiEnabled] = useState(null);  // null = loading
+  const [tab,       setTab]       = useState(null);   // set after config loaded
+  const [intel,     setIntel]     = useState(null);
+  const [intelLoad, setIntelLoad] = useState(true);
+  const [editing,   setEditing]   = useState(false);
 
   // AI explanation state
-  const [aiData,    setAiData]   = useState(null);
-  const [aiLoading, setAiLoading]= useState(true);
-  const [aiError,   setAiError]  = useState(null);
+  const [aiData,    setAiData]    = useState(null);
+  const [aiLoading, setAiLoading] = useState(true);
+  const [aiError,   setAiError]   = useState(null);
 
-  // Fetch threat-intel (manual notes)
+  // On open: check AI enabled status, then set default tab
+  useEffect(() => {
+    if (!alert) return;
+    fetch('/settings/explain')
+      .then(r => r.json())
+      .then(d => {
+        setAiEnabled(d.enabled);
+        setTab(d.enabled ? 'ai' : 'intel');
+      })
+      .catch(() => { setAiEnabled(false); setTab('intel'); });
+  }, [alert?.sig_id]);
+
+  // Fetch threat-intel notes
   useEffect(() => {
     if (!alert) return;
     setIntelLoad(true); setIntel(null); setEditing(false);
@@ -27,14 +43,12 @@ export function ExplainDialog({ alert, role, onClose }) {
       .catch(() => setIntelLoad(false));
   }, [alert?.sig_id, alert?.category]);
 
-  // Fetch AI explanation immediately on open — backend has likely already cached it.
-  // We always try on mount so the summary is ready whether the user opens
-  // the AI tab first or the Intel tab first.
+  // Fetch AI explanation on open (if enabled) — expected to be cached
   useEffect(() => {
-    if (!alert) return;
-    if (aiData && aiData.sig_id === alert.sig_id) return; // already loaded
+    if (!alert || !aiEnabled) return;
+    if (aiData && aiData.sig_id === alert.sig_id) return;
     fetchAi(false);
-  }, [alert?.sig_id]);
+  }, [alert?.sig_id, aiEnabled]);
 
   function fetchAi(force) {
     setAiLoading(true); setAiError(null);
@@ -60,7 +74,7 @@ export function ExplainDialog({ alert, role, onClose }) {
       .catch(() => { setAiError('Network error — could not reach the server.'); setAiLoading(false); });
   }
 
-  if (!alert) return null;
+  if (!alert || tab === null) return null;  // wait for config
 
   const fmtAge = ts => {
     const s = Math.floor(Date.now() / 1000 - ts);
@@ -122,12 +136,15 @@ export function ExplainDialog({ alert, role, onClose }) {
           </button>
         </div>
 
-        {/* Tabs */}
+        {/* Tabs — AI tab only shown when enabled */}
         <div style={{
           display: 'flex', gap: 0, borderBottom: '1px solid var(--border)',
           padding: '0 20px', flexShrink: 0, background: 'var(--bg1)',
         }}>
-          {[{ id:'ai', label:'AI Explanation' }, { id:'intel', label:'Threat Intel' }].map(t => (
+          {[
+            aiEnabled ? { id:'ai', label:'AI Explanation' } : null,
+            { id:'intel', label:'Threat Intel' },
+          ].filter(Boolean).map(t => (
             <button key={t.id} onClick={() => setTab(t.id)} style={{
               background: 'none', border: 'none', padding: '8px 14px',
               fontSize: 11, fontFamily: 'var(--mono)', cursor: 'pointer',
@@ -144,7 +161,7 @@ export function ExplainDialog({ alert, role, onClose }) {
             {aiLoading && (
               <div style={{ color: 'var(--text3)', fontFamily: 'var(--mono)',
                             fontSize: 12, textAlign: 'center', padding: '30px 0' }}>
-                <div style={{ marginBottom: 8 }}>Loading summary…</div>
+                <div style={{ marginBottom: 8, color: 'var(--text2)' }}>Loading summary…</div>
                 <div style={{
                   width: 24, height: 24, border: '2px solid var(--border2)',
                   borderTopColor: 'var(--accent)', borderRadius: '50%',
@@ -187,6 +204,13 @@ export function ExplainDialog({ alert, role, onClose }) {
                   </span>
                   <span style={{ fontSize: 10, color: 'var(--text3)', fontFamily: 'var(--mono)' }}>
                     {fmtAge(aiData.generated_at)} · {aiData.model}
+                    {aiData.provider && (
+                      <span style={{
+                        display: 'inline-block', width: 7, height: 7,
+                        borderRadius: '50%', marginLeft: 4, verticalAlign: 'middle',
+                        background: PROVIDER_COLOR[aiData.provider] || 'var(--accent)',
+                      }}/>
+                    )}
                   </span>
                   {(role === 'admin' || role === 'analyst') && (
                     <button onClick={() => fetchAi(true)} style={{
