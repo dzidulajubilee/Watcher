@@ -127,6 +127,15 @@ class AuthManager:
         c.execute("DELETE FROM sessions WHERE token = ?", (token,))
         c.commit()
 
+    def revoke_sessions_for_user(self, username: str):
+        """Invalidate all active sessions belonging to a specific user."""
+        c   = self._conn()
+        cur = c.execute("DELETE FROM sessions WHERE username = ?", (username,))
+        c.commit()
+        if cur.rowcount:
+            log.info("Revoked %d session(s) for user '%s' after password change.",
+                     cur.rowcount, username)
+
     def revoke_all_sessions(self):
         """Invalidate every active session — called when RBAC is first enabled."""
         c   = self._conn()

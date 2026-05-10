@@ -96,6 +96,7 @@ export function FlowsView({ rows, loading, selected, onSelect, onClear }) {
             </tbody>
           </table>
         )}
+
       </div>
 
       {showClear && (
@@ -165,7 +166,8 @@ export function FlowDetail({ item }) {
 }
 
 // ── DNSView ───────────────────────────────────────────────────────────────────
-export function DNSView({ rows, loading, selected, onSelect, onClear }) {
+export function DNSView({ rows, loading, selected, onSelect, onClear,
+                          totalDns=0, loadingMore=false, onLoadMore }) {
   const [search, setSearch] = useState('');
   const [showClear, setShowClear] = useState(false);
   const q = search.toLowerCase();
@@ -225,6 +227,30 @@ export function DNSView({ rows, loading, selected, onSelect, onClear }) {
               ))}
             </tbody>
           </table>
+        )}
+
+        {/* Load More */}
+        {rows.length < totalDns && (
+          <div style={{
+            padding:'10px 0', textAlign:'center',
+            borderTop:'1px solid var(--border)',
+            background:'var(--bg1)',
+          }}>
+            <button
+              onClick={onLoadMore}
+              disabled={loadingMore}
+              style={{
+                background:'var(--bg2)', border:'1px solid var(--border2)',
+                color:'var(--text2)', fontFamily:'var(--mono)', fontSize:11,
+                padding:'5px 18px', borderRadius:'var(--radius-md)',
+                cursor: loadingMore ? 'default' : 'pointer',
+                opacity: loadingMore ? 0.6 : 1, transition:'opacity .15s',
+              }}>
+              {loadingMore
+                ? 'Loading…'
+                : `Load more  (${(totalDns - rows.length).toLocaleString()} remaining)`}
+            </button>
+          </div>
         )}
       </div>
 

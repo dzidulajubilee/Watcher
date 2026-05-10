@@ -106,7 +106,7 @@ function UserForm({ initial, onSave, onCancel }) {
 // ── WebhookForm ───────────────────────────────────────────────────────────────
 function WebhookForm({ initial, onSave, onCancel }) {
   const blank = { name:'', type:'generic', url:'', enabled:true,
-                  severities:['critical','high','medium','low','info'] };
+                  severities:['critical','high','medium','low','info'], allow_local_ips:false };
   const [form,   setForm]   = useState(initial || blank);
   const [saving, setSaving] = useState(false);
   const [error,  setError]  = useState('');
@@ -182,6 +182,41 @@ function WebhookForm({ initial, onSave, onCancel }) {
                  form.type === 'discord' ? 'https://discord.com/api/webhooks/…' :
                                           'https://your-endpoint.com/webhook'}
                value={form.url} onChange={e => setForm(f => ({ ...f, url: e.target.value }))}/>
+      </div>
+
+      {/* Allow Local IPs — for n8n and other self-hosted targets */}
+      <div style={{ marginBottom:14 }}>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
+                      padding:'10px 12px', borderRadius:'var(--radius-md)',
+                      background: form.allow_local_ips ? 'rgba(79,156,249,.06)' : 'var(--bg2)',
+                      border:`1px solid ${form.allow_local_ips ? 'rgba(79,156,249,.25)' : 'var(--border)'}`,
+                      transition:'all .15s' }}>
+          <div>
+            <div style={{ fontSize:12, fontWeight:600, color:'var(--text1)', marginBottom:2 }}>
+              Allow Local / Private IPs
+            </div>
+            <div style={{ fontSize:10, color:'var(--text3)', fontFamily:'var(--mono)', lineHeight:1.5 }}>
+              {form.allow_local_ips
+                ? 'Local IPs allowed — suitable for n8n or self-hosted webhooks.'
+                : 'Blocked — prevents SSRF attacks. Enable only for local targets (e.g. n8n).'}
+            </div>
+          </div>
+          <button onClick={() => setForm(f => ({ ...f, allow_local_ips: !f.allow_local_ips }))}
+            style={{
+              flexShrink:0, marginLeft:16,
+              width:44, height:24, borderRadius:12,
+              border:'none', cursor:'pointer', transition:'background .2s', position:'relative',
+              background: form.allow_local_ips ? 'var(--accent)' : 'var(--bg3)',
+            }}>
+            <span style={{
+              position:'absolute', top:2,
+              left: form.allow_local_ips ? 22 : 2,
+              width:20, height:20, borderRadius:'50%',
+              background:'white', transition:'left .2s',
+              boxShadow:'0 1px 3px rgba(0,0,0,.3)',
+            }}/>
+          </button>
+        </div>
       </div>
 
       <div style={{ marginBottom:14 }}>
@@ -407,18 +442,213 @@ function WebhooksView({ webhooks, onRefresh, triggerNew }) {
 }
 
 // ── SettingsView ──────────────────────────────────────────────────────────────
+// ── DataControlPanel ─────────────────────────────────────────────────────────
+function DataControlPanel({ role }) {
+  // ── Replay state ──────────────────────────────────────────────────────────
+  const [replayStatus, setReplayStatus] = useState(null); // null|'starting'|'running'|{result}
+  const [replayPoll,   setReplayPoll]   = useState(null);
+
+  // ── Flush state ───────────────────────────────────────────────────────────
+  const [showFlushDlg, setShowFlushDlg] = useState(false);
+  const [flushing,     setFlushing]     = useState(false);
+  const [flushResult,  setFlushResult]  = useState(null);
+
+  // Poll replay status while running
+  useEffect(() => {
+    if (replayStatus !== 'running' && replayStatus !== 'starting') return;
+    const id = setInterval(() => {
+      fetch('/admin/replay')
+        .then(r => r.json())
+        .then(d => {
+          if (d.status === 'idle' && d.result) {
+            setReplayStatus(d.result);
+            clearInterval(id);
+          }
+        })
+        .catch(() => {});
+    }, 2000);
+    setReplayPoll(id);
+    return () => clearInterval(id);
+  }, [replayStatus]);
+
+  function startReplay() {
+    setReplayStatus('starting');
+    setFlushResult(null);
+    fetch('/admin/replay', { method: 'POST' })
+      .then(r => r.json())
+      .then(d => {
+        if (d.error) { setReplayStatus({ error: d.error }); return; }
+        setReplayStatus('running');
+      })
+      .catch(() => setReplayStatus({ error: 'Network error.' }));
+  }
+
+  function doFlush() {
+    setFlushing(true);
+    fetch('/admin/flush', { method: 'DELETE' })
+      .then(r => r.json())
+      .then(d => {
+        setFlushing(false);
+        setShowFlushDlg(false);
+        setFlushResult(d.deleted);
+        setReplayStatus(null);
+      })
+      .catch(() => { setFlushing(false); setShowFlushDlg(false); });
+  }
+
+  if (role !== 'admin') return (
+    <div style={{ padding:24, color:'var(--text3)', fontFamily:'var(--mono)', fontSize:12 }}>
+      Data Control is restricted to admins.
+    </div>
+  );
+
+  const replayRunning = replayStatus === 'running' || replayStatus === 'starting';
+  const replayDone    = replayStatus && typeof replayStatus === 'object' && !replayStatus.error;
+  const replayErr     = replayStatus?.error;
+
+  return (
+    <div style={{ padding:20, maxWidth:560, display:'flex', flexDirection:'column', gap:20 }}>
+
+      {/* ── Replay ── */}
+      <div className="wh-section">
+        <div className="wh-section-title">Replay eve.json</div>
+        <div className="wh-card">
+          <div style={{ fontSize:12, color:'var(--text2)', lineHeight:1.7, marginBottom:14 }}>
+            Re-reads <code style={{ fontFamily:'var(--mono)', fontSize:11 }}>/var/log/suricata/eve.json</code> from
+            the beginning and inserts all events into the database. Useful after a Watcher restart
+            to catch alerts generated while the service was down.
+            <br/><br/>
+            Runs in the background — you can navigate away while it processes.
+          </div>
+
+          <div style={{ display:'flex', alignItems:'center', gap:12 }}>
+            <button className="btn" onClick={startReplay} disabled={replayRunning}
+              style={{ fontSize:11, opacity: replayRunning ? 0.5 : 1 }}>
+              {replayRunning ? 'Replaying…' : '↺  Replay eve.json'}
+            </button>
+            {replayRunning && (
+              <div style={{
+                width:16, height:16, border:'2px solid var(--border2)',
+                borderTopColor:'var(--accent)', borderRadius:'50%',
+                animation:'spin .8s linear infinite',
+              }}/>
+            )}
+          </div>
+
+          {replayDone && (
+            <div style={{
+              marginTop:12, padding:'8px 12px', borderRadius:'var(--radius-md)',
+              background:'rgba(52,199,89,.08)', border:'1px solid rgba(52,199,89,.2)',
+              fontSize:11, fontFamily:'var(--mono)', color:'var(--green)',
+            }}>
+              ✓ Done — {replayStatus.inserted?.toLocaleString()} inserted ·{' '}
+              {replayStatus.skipped?.toLocaleString()} skipped ·{' '}
+              {replayStatus.lines?.toLocaleString()} lines read
+            </div>
+          )}
+          {replayErr && (
+            <div style={{
+              marginTop:12, padding:'8px 12px', borderRadius:'var(--radius-md)',
+              background:'rgba(240,84,84,.08)', border:'1px solid rgba(240,84,84,.2)',
+              fontSize:11, fontFamily:'var(--mono)', color:'var(--red)',
+            }}>
+              ✗ {replayErr}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Flush ── */}
+      <div className="wh-section">
+        <div className="wh-section-title">Flush All Records</div>
+        <div className="wh-card">
+          <div style={{ fontSize:12, color:'var(--text2)', lineHeight:1.7, marginBottom:14 }}>
+            Permanently deletes <strong>all</strong> alerts, flows, DNS queries, and HTTP events
+            from the database. This cannot be undone.
+          </div>
+          <button onClick={() => { setShowFlushDlg(true); setFlushResult(null); }}
+            style={{
+              fontSize:11, padding:'6px 16px', borderRadius:'var(--radius-md)',
+              background:'rgba(240,84,84,.12)', color:'var(--red)',
+              border:'1px solid rgba(240,84,84,.3)', cursor:'pointer', fontFamily:'var(--mono)',
+            }}>
+            🗑  Flush All Records
+          </button>
+          {flushResult && (
+            <div style={{
+              marginTop:12, padding:'8px 12px', borderRadius:'var(--radius-md)',
+              background:'rgba(52,199,89,.08)', border:'1px solid rgba(52,199,89,.2)',
+              fontSize:11, fontFamily:'var(--mono)', color:'var(--green)',
+            }}>
+              ✓ Flushed — alerts: {flushResult.alerts?.toLocaleString()} ·
+              flows: {flushResult.flows?.toLocaleString()} ·
+              dns: {flushResult.dns_events?.toLocaleString()} ·
+              http: {flushResult.http_events?.toLocaleString()}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Flush confirmation dialog ── */}
+      {showFlushDlg && (
+        <div style={{
+          position:'fixed', inset:0, background:'rgba(0,0,0,.6)',
+          display:'flex', alignItems:'center', justifyContent:'center',
+          zIndex:1000,
+        }}>
+          <div style={{
+            background:'var(--bg2)', border:'1px solid var(--border)',
+            borderRadius:'var(--radius-lg)', padding:'28px 32px',
+            width:380, maxWidth:'90vw', animation:'slideUp .2s ease-out',
+          }}>
+            <div style={{ fontSize:16, fontWeight:700, color:'var(--red)', marginBottom:10 }}>
+              ⚠ Flush All Records?
+            </div>
+            <div style={{ fontSize:12, color:'var(--text2)', lineHeight:1.7, marginBottom:20 }}>
+              This will permanently delete <strong>all</strong> alerts, flows, DNS, and HTTP
+              records from the database. The action <strong>cannot be undone</strong>.
+              <br/><br/>
+              Are you sure you want to continue?
+            </div>
+            <div style={{ display:'flex', gap:10, justifyContent:'flex-end' }}>
+              <button onClick={() => setShowFlushDlg(false)}
+                style={{
+                  padding:'7px 18px', borderRadius:'var(--radius-md)',
+                  background:'var(--bg3)', border:'1px solid var(--border)',
+                  color:'var(--text1)', fontSize:12, cursor:'pointer',
+                }}>
+                Cancel
+              </button>
+              <button onClick={doFlush} disabled={flushing}
+                style={{
+                  padding:'7px 18px', borderRadius:'var(--radius-md)',
+                  background:'var(--red)', border:'none',
+                  color:'white', fontSize:12, cursor:'pointer', fontWeight:600,
+                  opacity: flushing ? 0.6 : 1,
+                }}>
+                {flushing ? 'Flushing…' : 'Yes, Flush Everything'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── AiExplainPanel ────────────────────────────────────────────────────────────
 const PROVIDER_META = {
   deepseek:  { label: 'DeepSeek',          color: '#4D6BFE', model: 'deepseek-chat',              site: 'platform.deepseek.com/api_keys' },
   openai:    { label: 'OpenAI',            color: '#10A37F', model: 'gpt-4o-mini',                 site: 'platform.openai.com/api-keys'   },
   anthropic: { label: 'Anthropic (Claude)', color: '#D4793B', model: 'claude-haiku-4-5-20251001', site: 'console.anthropic.com/settings/keys' },
+  nvidia:    { label: 'NVIDIA NIM',        color: '#76B900', model: 'deepseek-ai/deepseek-v4-pro', site: 'build.nvidia.com' },
 };
 
 function AiExplainPanel({ role }) {
   const [cfg,     setCfg]     = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving,  setSaving]  = useState(false);
-  const [keyInputs, setKeyInputs] = useState({ deepseek: '', openai: '', anthropic: '' });
+  const [keyInputs, setKeyInputs] = useState({ deepseek: '', openai: '', anthropic: '', nvidia: '' });
   const [msg,     setMsg]     = useState(null);   // { text, ok }
 
   useEffect(() => {
@@ -670,7 +900,7 @@ export function SettingsView({ currentUser, webhooks, onRefreshWebhooks, role })
         <div style={{ display:'flex', gap:1, background:'var(--bg2)',
                       border:'1px solid var(--border)', borderRadius:'var(--radius-sm)',
                       padding:2, marginLeft:10 }}>
-          {[{ id:'users', label:'Users' }, { id:'webhooks', label:'Webhooks' }, { id:'threat-intel', label:'Threat Intel' }, { id:'suppression', label:'Suppression' }, { id:'ai-explain', label:'AI Explain' }].map(t => (
+          {[{ id:'users', label:'Users' }, { id:'webhooks', label:'Webhooks' }, { id:'threat-intel', label:'Threat Intel' }, { id:'suppression', label:'Suppression' }, { id:'ai-explain', label:'AI Explain' }, { id:'data-control', label:'Data Control' }].map(t => (
             <button key={t.id} onClick={() => setTab(t.id)} style={{
               padding:'2px 12px', borderRadius:'var(--radius-sm)', border:'none',
               background: tab===t.id ? 'var(--accent)' : 'transparent',
@@ -712,6 +942,9 @@ export function SettingsView({ currentUser, webhooks, onRefreshWebhooks, role })
         )}
         {tab === 'ai-explain' && (
           <AiExplainPanel role={role}/>
+        )}
+        {tab === 'data-control' && (
+          <DataControlPanel role={role}/>
         )}
         {tab === 'users' && (<>
           <div className="wh-section">

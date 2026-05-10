@@ -21,6 +21,78 @@ log = logging.getLogger("watcher.webhooks")
 # Severities in order — used for filtering UI
 ALL_SEVERITIES = ["critical", "high", "medium", "low", "info"]
 
+# ── SSRF protection ──────────────────────────────────────────────────────────
+# Webhook URLs are validated before delivery and before saving.
+# By default, private/loopback ranges are blocked to prevent SSRF.
+# Set allow_local_ips=True (via Settings → Webhooks → Allow Local IPs)
+# if your webhook target is on the same network — e.g. n8n running locally.
+
+import ipaddress
+import urllib.parse
+
+_PRIVATE_NETWORKS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),   # link-local
+    ipaddress.ip_network("::1/128"),           # IPv6 loopback
+    ipaddress.ip_network("fc00::/7"),          # IPv6 ULA
+]
+
+_ALLOWED_SCHEMES = {"http", "https"}
+
+
+def validate_webhook_url(url: str, allow_local: bool = False) -> str | None:
+    """
+    Validate a webhook URL for safety.
+    Returns None if OK, or an error string if blocked.
+
+    allow_local=True permits RFC1918 / loopback destinations (e.g. n8n on LAN).
+    allow_local=False (default) blocks all private/loopback IPs — SSRF protection.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return "Invalid URL"
+
+    if parsed.scheme.lower() not in _ALLOWED_SCHEMES:
+        return f"URL scheme '{parsed.scheme}' not allowed (use http or https)"
+
+    hostname = parsed.hostname
+    if not hostname:
+        return "URL has no hostname"
+
+    # Block metadata endpoints by hostname
+    if hostname.lower() in ("169.254.169.254", "metadata.google.internal"):
+        return "URL targets a cloud metadata endpoint"
+
+    if allow_local:
+        return None   # n8n / local targets explicitly permitted
+
+    # Resolve and check every address the hostname maps to
+    import socket
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return f"Cannot resolve hostname: {hostname}"
+
+    for info in infos:
+        addr_str = info[4][0]
+        try:
+            addr = ipaddress.ip_address(addr_str)
+        except ValueError:
+            continue
+        for net in _PRIVATE_NETWORKS:
+            if addr in net:
+                return (
+                    f"URL resolves to private/loopback address {addr_str}. "
+                    "Enable 'Allow Local IPs' in Webhook settings if your "
+                    "webhook target (e.g. n8n) is on the local network."
+                )
+    return None
+
+
 # How many delivery attempts before giving up on one alert
 MAX_RETRIES    = 3
 RETRY_DELAY    = 5      # seconds between retries
@@ -53,25 +125,30 @@ class WebhookDB:
         c = self._conn()
         c.execute("""
             CREATE TABLE IF NOT EXISTS webhooks (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                name       TEXT    NOT NULL,
-                type       TEXT    NOT NULL DEFAULT 'generic',
-                url        TEXT    NOT NULL,
-                enabled    INTEGER NOT NULL DEFAULT 1,
-                severities TEXT    NOT NULL DEFAULT '["critical","high","medium","low","info"]',
-                created_at REAL    NOT NULL,
-                last_fired REAL,
-                fire_count INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                name            TEXT    NOT NULL,
+                type            TEXT    NOT NULL DEFAULT 'generic',
+                url             TEXT    NOT NULL,
+                enabled         INTEGER NOT NULL DEFAULT 1,
+                severities      TEXT    NOT NULL DEFAULT '["critical","high","medium","low","info"]',
+                allow_local_ips INTEGER NOT NULL DEFAULT 0,
+                created_at      REAL    NOT NULL,
+                last_fired      REAL,
+                fire_count      INTEGER NOT NULL DEFAULT 0,
+                last_error      TEXT
             )
         """)
+        # Migration: add allow_local_ips column for existing installs
+        cols = {r[1] for r in c.execute("PRAGMA table_info(webhooks)").fetchall()}
+        if "allow_local_ips" not in cols:
+            c.execute("ALTER TABLE webhooks ADD COLUMN allow_local_ips INTEGER NOT NULL DEFAULT 0")
         c.commit()
 
     # ── CRUD ──────────────────────────────────────────────────────────────────
 
     def get_all(self) -> list[dict]:
         rows = self._conn().execute("""
-            SELECT id, name, type, url, enabled, severities,
+            SELECT id, name, type, url, enabled, severities, allow_local_ips,
                    created_at, last_fired, fire_count, last_error
             FROM webhooks ORDER BY id
         """).fetchall()
@@ -79,26 +156,27 @@ class WebhookDB:
 
     def get(self, wid: int) -> dict | None:
         row = self._conn().execute(
-            "SELECT id, name, type, url, enabled, severities, "
+            "SELECT id, name, type, url, enabled, severities, allow_local_ips, "
             "created_at, last_fired, fire_count, last_error "
             "FROM webhooks WHERE id = ?", (wid,)
         ).fetchone()
         return self._row_to_dict(row) if row else None
 
     def create(self, name: str, wtype: str, url: str,
-               severities: list, enabled: bool = True) -> dict:
+               severities: list, enabled: bool = True,
+               allow_local_ips: bool = False) -> dict:
         now = time.time()
         c   = self._conn()
         cur = c.execute("""
-            INSERT INTO webhooks (name, type, url, enabled, severities, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO webhooks (name, type, url, enabled, severities, allow_local_ips, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (name, wtype, url, 1 if enabled else 0,
-              json.dumps(severities), now))
+              json.dumps(severities), 1 if allow_local_ips else 0, now))
         c.commit()
         return self.get(cur.lastrowid)
 
     def update(self, wid: int, **fields) -> dict | None:
-        allowed = {"name", "type", "url", "enabled", "severities"}
+        allowed = {"name", "type", "url", "enabled", "severities", "allow_local_ips"}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return self.get(wid)
@@ -106,6 +184,13 @@ class WebhookDB:
             updates["severities"] = json.dumps(updates["severities"])
         if "enabled" in updates:
             updates["enabled"] = 1 if updates["enabled"] else 0
+        if "allow_local_ips" in updates:
+            updates["allow_local_ips"] = 1 if updates["allow_local_ips"] else 0
+            # BUG FIX: when the user enables "Allow Local / Private IPs", clear
+            # any stale SSRF-blocked last_error so the UI no longer shows the old
+            # "Blocked: URL resolves to private/loopback address" banner.
+            if updates["allow_local_ips"]:
+                updates["last_error"] = None
         cols = ", ".join(f"{k} = ?" for k in updates)
         vals = list(updates.values()) + [wid]
         c = self._conn()
@@ -141,7 +226,8 @@ class WebhookDB:
             d["severities"] = json.loads(d.get("severities", "[]"))
         except Exception:
             d["severities"] = ALL_SEVERITIES
-        d["enabled"] = bool(d.get("enabled", 1))
+        d["enabled"]         = bool(d.get("enabled", 1))
+        d["allow_local_ips"] = bool(d.get("allow_local_ips", 0))
         return d
 
 
@@ -262,11 +348,15 @@ def build_payload(wtype: str, alert: dict) -> dict:
 
 # ── HTTP delivery ─────────────────────────────────────────────────────────────
 
-def deliver(url: str, payload: dict) -> str | None:
+def deliver(url: str, payload: dict, allow_local: bool = False) -> str | None:
     """
     POST payload as JSON to url.
     Returns None on success, or an error string on failure.
+    Validates URL for SSRF before connecting (allow_local bypasses for n8n etc.)
     """
+    ssrf_err = validate_webhook_url(url, allow_local=allow_local)
+    if ssrf_err:
+        return f"Blocked: {ssrf_err}"
     body = json.dumps(payload).encode()
     req  = urllib.request.Request(
         url,
@@ -317,9 +407,10 @@ def delivery_worker(wdb: WebhookDB):
         url     = webhook.get("url", "")
         payload = build_payload(wtype, alert)
 
+        allow_local = webhook.get("allow_local_ips", False)
         error = None
         for attempt in range(1, MAX_RETRIES + 1):
-            error = deliver(url, payload)
+            error = deliver(url, payload, allow_local=allow_local)
             if error is None:
                 log.info("Webhook %d (%s) fired OK for alert %s",
                          wid, webhook.get("name","?"), alert.get("sig_id","?"))

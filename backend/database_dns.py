@@ -135,17 +135,30 @@ class DnsDB:
 
     # ── Fetch ─────────────────────────────────────────────────────────────────
 
-    def fetch(self, days: int = None, limit: int = 5000) -> list[dict]:
+    def fetch(self, days: int = None, limit: int = 300,
+              offset: int = 0, **kwargs) -> dict:
+        """
+        Paginated fetch. Returns { "rows": [...], "total": N }.
+        Total is cached via _precomputed_total kwarg when available.
+        """
         cutoff = time.time() - (days or self.retain_days) * 86400
-        rows   = self._conn().execute(
+        conn   = self._conn()
+
+        total = kwargs.get("_precomputed_total")
+        if total is None:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM dns_events WHERE ts_epoch >= ?", (cutoff,)
+            ).fetchone()[0]
+
+        rows = conn.execute(
             """SELECT id, ts, src_ip, src_port, dst_ip, dst_port,
                       flow_id, tx_id, dns_type, rrname, rrtype,
                       rcode, ttl, answers
                FROM   dns_events
                WHERE  ts_epoch >= ?
                ORDER  BY ts_epoch DESC
-               LIMIT  ?""",
-            (cutoff, limit),
+               LIMIT  ? OFFSET ?""",
+            (cutoff, limit, offset),
         ).fetchall()
         result = []
         for row in rows:
@@ -155,9 +168,16 @@ class DnsDB:
             except Exception:
                 d["answers"] = []
             result.append(d)
-        return result
+        return {"rows": result, "total": total}
 
     # ── Maintenance ───────────────────────────────────────────────────────────
+
+    def flush_all(self) -> int:
+        """Delete all DNS records. Returns deleted count."""
+        conn = self._conn()
+        cur  = conn.execute("DELETE FROM dns_events")
+        conn.commit()
+        return cur.rowcount
 
     def purge_old(self):
         cutoff = time.time() - self.retain_days * 86400

@@ -38,9 +38,6 @@ case "$1" in
     fi
 
     # ── Bootstrap admin credentials (first install only) ─────────────────────
-    # Generate the password and seed the DB *before* starting the service so
-    # we can display it in the banner below.  On upgrades the DB already has
-    # users, so the Python snippet exits without changing anything.
     CONFIG_DB="/var/lib/watcher/config.db"
 
     ADMIN_PW=$(python3 - "$CONFIG_DB" <<'PYEOF'
@@ -49,7 +46,6 @@ import sys, sqlite3, secrets, hashlib, time
 db_path = sys.argv[1]
 con = sqlite3.connect(db_path)
 
-# Mirror the exact schema from users.py / config_db.py
 con.executescript("""
     CREATE TABLE IF NOT EXISTS sessions (
         token      TEXT PRIMARY KEY,
@@ -70,7 +66,6 @@ con.executescript("""
 """)
 con.commit()
 
-# Only seed if no users exist yet (skip on upgrades)
 count = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 if count > 0:
     print("")
@@ -92,7 +87,6 @@ print(pw)
 PYEOF
     )
 
-    # Lock down the DB so only the watcher group can read it
     chown watcher:watcher "$CONFIG_DB" 2>/dev/null || true
     chmod 640 "$CONFIG_DB"             2>/dev/null || true
 
@@ -109,7 +103,7 @@ PYEOF
     # ── Install banner ────────────────────────────────────────────────────────
     echo ""
     echo "┌─────────────────────────────────────────────────────────┐"
-    echo "│  Watcher IDS v1.1.0 installed successfully              │"
+    echo "│  Watcher IDS v1.7.0 installed successfully              │"
     echo "│                                                         │"
     echo "│  Dashboard  →  http://localhost:8765/                   │"
     echo "│  Logs       →  journalctl -u watcher -f                 │"
@@ -127,11 +121,15 @@ PYEOF
     fi
 
     echo "│                                                         │"
-    echo "│  New in v1.1.0:                                         │"
-    echo "│    • Explain button on any selected alert               │"
-    echo "│    • Threat Intel — Settings → Threat Intel             │"
-    echo "│    • Suppression Rules — Settings → Suppression         │"
-    echo "│    • watcher user added to suricata group               │"
+    echo "│  What's new in v1.7.0:                                  │"
+    echo "│    • AI Explain — executive summaries on every alert    │"
+    echo "│      DeepSeek / OpenAI / Claude / NVIDIA NIM            │"
+    echo "│    • Auto-generate summary on each new unique SID       │"
+    echo "│    • Settings → AI Explain: enable, pick provider,      │"
+    echo "│      manage API keys per-provider via UI or watcher.conf│"
+    echo "│    • Fix: webhook Test now respects Allow Local IPs      │"
+    echo "│    • Fix: stale blocked-error cleared when local IPs on │"
+    echo "│    • Fully air-gapped — zero external font/CDN deps     │"
     echo "└─────────────────────────────────────────────────────────┘"
     echo ""
     ;;

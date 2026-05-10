@@ -153,6 +153,101 @@ class ThreatIntelDB:
         }
         return [r for r in top_sids if r["sig_id"] not in covered][:limit]
 
+    # ── Import / Export ───────────────────────────────────────────────────────
+
+    def export_all(self) -> list[dict]:
+        """Return all entries as a clean list for JSON export."""
+        rows = self.get_all()
+        export = []
+        for r in rows:
+            export.append({
+                "sig_id":      r.get("sig_id"),
+                "sig_msg":     r.get("sig_msg"),
+                "category":    r.get("category"),
+                "explanation": r.get("explanation", ""),
+                "tags":        r.get("tags", []),
+                "refs":        r.get("refs", []),
+            })
+        return export
+
+    def import_entries(self, entries: list[dict],
+                       imported_by: str = "import") -> dict:
+        """
+        Bulk import from a parsed JSON array.
+        Strategy:
+          - If a matching entry already exists (same sig_id OR same category
+            when sig_id is null) it is UPDATED with the incoming data.
+          - Otherwise a new entry is created.
+        Returns { imported, updated, skipped, errors: [str] }
+        """
+        imported = updated = skipped = 0
+        errors   = []
+
+        for i, raw in enumerate(entries):
+            try:
+                explanation = str(raw.get("explanation", "")).strip()
+                if not explanation:
+                    errors.append(f"Entry {i+1}: missing explanation — skipped")
+                    skipped += 1
+                    continue
+
+                sig_id   = raw.get("sig_id")
+                category = str(raw.get("category", "")).strip() or None
+                sig_msg  = str(raw.get("sig_msg",  "")).strip() or None
+
+                if sig_id is not None:
+                    try:
+                        sig_id = int(sig_id)
+                    except (ValueError, TypeError):
+                        errors.append(f"Entry {i+1}: invalid sig_id '{sig_id}' — skipped")
+                        skipped += 1
+                        continue
+
+                if sig_id is None and not category:
+                    errors.append(f"Entry {i+1}: needs sig_id or category — skipped")
+                    skipped += 1
+                    continue
+
+                tags = raw.get("tags", [])
+                refs = raw.get("refs", [])
+                if not isinstance(tags, list): tags = []
+                if not isinstance(refs, list): refs = []
+                tags = [str(t) for t in tags if t]
+                refs = [str(r) for r in refs if r]
+
+                # Check for existing match
+                existing = None
+                if sig_id is not None:
+                    existing = self._conn().execute(
+                        "SELECT id FROM threat_intel WHERE sig_id = ? LIMIT 1",
+                        (sig_id,)
+                    ).fetchone()
+                elif category:
+                    existing = self._conn().execute(
+                        "SELECT id FROM threat_intel "
+                        "WHERE sig_id IS NULL AND category = ? COLLATE NOCASE LIMIT 1",
+                        (category,)
+                    ).fetchone()
+
+                if existing:
+                    self.update(existing[0],
+                                sig_id=sig_id, sig_msg=sig_msg, category=category,
+                                explanation=explanation, tags=tags, refs=refs)
+                    updated += 1
+                else:
+                    self.create(sig_id=sig_id, sig_msg=sig_msg, category=category,
+                                explanation=explanation, tags=tags, refs=refs,
+                                created_by=imported_by)
+                    imported += 1
+
+            except Exception as exc:
+                errors.append(f"Entry {i+1}: {exc}")
+                skipped += 1
+
+        log.info("TI import: %d new, %d updated, %d skipped", imported, updated, skipped)
+        return {"imported": imported, "updated": updated,
+                "skipped": skipped, "errors": errors}
+
     def stats(self) -> dict:
         c      = self._conn()
         total  = c.execute("SELECT COUNT(*) FROM threat_intel").fetchone()[0]

@@ -26,9 +26,17 @@ class Handler(BaseHTTPRequestHandler):
     dns_db   = None
     ti_db    = None
     sup_db   = None
-    explain_engine  = None
+    explain_engine = None
     # Stats cache: (data, expires_at) — avoids 7 DB queries on every /health poll
     _stats_cache: "tuple | None" = None
+    _stats_lock = __import__("threading").Lock()
+    eve_path = None   # pathlib.Path to eve.json — set by server.py
+    # Replay state: None | "running" | { result dict }
+    _replay_state: "dict | str | None" = None
+    _replay_lock = __import__("threading").Lock()
+    # Login rate limit: {ip: [timestamp, ...]} — max 10 attempts per 5 min window
+    _login_attempts: dict = {}
+    _login_lock = __import__("threading").Lock()
 
     server_version = ""
     sys_version    = ""
@@ -95,12 +103,53 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    # ── Engine status ─────────────────────────────────────────────────────────
+    _ENGINE_IDLE_SECS = 30   # seconds since last write before status → idle
+
+    @classmethod
+    def _engine_status(cls) -> dict:
+        """
+        Determine Suricata engine status by inspecting eve.json mtime.
+
+        Returns:
+          { "status": "running" | "idle" | "stopped",
+            "mtime":  <epoch float | null> }
+
+        running : eve.json modified within last 30 s  → engine is processing traffic
+        idle    : eve.json exists but older than 30 s → engine up, no recent traffic
+        stopped : eve.json missing / unreadable        → engine down or not configured
+        """
+        if cls.eve_path is None:
+            return {"status": "stopped", "mtime": None}
+        try:
+            mtime  = cls.eve_path.stat().st_mtime
+            age    = time.time() - mtime
+            status = "running" if age <= cls._ENGINE_IDLE_SECS else "idle"
+            return {"status": status, "mtime": mtime}
+        except OSError:
+            return {"status": "stopped", "mtime": None}
+
+    def _security_headers(self):
+        """Emit security headers on every response."""
+        self.send_header("X-Content-Type-Options",  "nosniff")
+        self.send_header("X-Frame-Options",         "DENY")
+        self.send_header("Referrer-Policy",         "no-referrer")
+        self.send_header("Content-Security-Policy",
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "font-src 'self'; "
+            "img-src 'self' data:; "
+            "connect-src 'self'; "
+            "frame-ancestors 'none'")
+
     def _json(self, data, status=200):
         body = json.dumps(data).encode()
         self.send_response(status)
         self.send_header("Content-Type",   "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control",  "no-cache")
+        self._security_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -116,12 +165,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", cache_control)
         elif no_cache:
             self.send_header("Cache-Control", "no-cache")
+        self._security_headers()
         self.end_headers()
         self.wfile.write(data)
+
+    _MAX_BODY = 1_048_576  # 1 MB hard cap — prevents memory exhaustion
 
     def _read_json(self):
         try:
             n = int(self.headers.get("Content-Length", 0))
+            if n > self._MAX_BODY:
+                self._json({"error": "Request body too large"}, 413)
+                return None
             return json.loads(self.rfile.read(n)) if n else {}
         except Exception:
             self._json({"error": "Bad request"}, 400)
@@ -174,6 +229,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(raw)
         elif path == "/webhooks":
             self._json(self.wdb.get_all())
+        elif path == "/settings/explain":
+            if not self._require_auth(): return
+            self._json(self.explain_engine.get_config())
         elif path == "/me":
             s = self._session()
             self._json({"username": s["username"], "role": s["role"]})
@@ -182,12 +240,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(self.um.get_all())
         elif path == "/health":
             now = time.time()
-            if (Handler._stats_cache is None or
-                    Handler._stats_cache[1] < now):
-                Handler._stats_cache = (self.db.stats(), now + 5)
+            with Handler._stats_lock:
+                if Handler._stats_cache is None or Handler._stats_cache[1] < now:
+                    Handler._stats_cache = (self.db.stats(), now + 5)
+                cached = Handler._stats_cache[0]
             self._json({"status": "ok",
                         "clients": self.registry.count(),
-                        "db":      Handler._stats_cache[0],
+                        "db":      cached,
+                        "engine":  self._engine_status(),
                         "time":    int(now)})
         elif path == "/threat-intel":
             self._json(self.ti_db.get_all())
@@ -201,11 +261,25 @@ class Handler(BaseHTTPRequestHandler):
             self._json(self.ti_db.coverage_gaps(top, limit=20))
         elif path == "/threat-intel/stats":
             self._json(self.ti_db.stats())
+        elif path == "/threat-intel/export":
+            if not self._require_auth(): return
+            data     = self.ti_db.export_all()
+            body     = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type",        "application/json; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="watcher-threat-intel.json"')
+            self.send_header("Content-Length",      str(len(body)))
+            self._security_headers()
+            self.end_headers()
+            self.wfile.write(body)
         elif path == "/suppression":
             self._json(self.sup_db.get_all())
-        elif path == "/settings/explain":
-            if not self._require_auth(): return
-            self._json(self.explain_engine.get_config())
+        elif path == "/admin/replay":
+            if not self._require_role("admin"): return
+            with Handler._replay_lock:
+                state = Handler._replay_state
+            self._json({"status": state if isinstance(state, str) else "idle",
+                        "result": state if isinstance(state, dict) else None})
         elif path.startswith("/frontend/"):
             self._serve_static(path)
         else:
@@ -232,12 +306,16 @@ class Handler(BaseHTTPRequestHandler):
             self._webhook_create()
         elif re.match(r"^/webhooks/\d+/test$", path):
             self._webhook_test(int(path.split("/")[2]))
-        elif path == "/threat-intel":
-            self._ti_create()
-        elif path == "/suppression":
-            self._sup_create()
         elif path == "/alerts/explain":
             self._explain_get_or_create()
+        elif path == "/threat-intel":
+            self._ti_create()
+        elif path == "/threat-intel/import":
+            self._ti_import()
+        elif path == "/suppression":
+            self._sup_create()
+        elif path == "/admin/replay":
+            self._admin_replay()
         else:
             self.send_error(404)
 
@@ -251,12 +329,12 @@ class Handler(BaseHTTPRequestHandler):
             self._user_update(int(path.split("/")[2]))
         elif re.match(r"^/webhooks/\d+$", path):
             self._webhook_update(int(path.split("/")[2]))
+        elif path == "/settings/explain":
+            self._explain_settings_update()
         elif re.match(r"^/threat-intel/\d+$", path):
             self._ti_update(int(path.split("/")[2]))
         elif re.match(r"^/suppression/\d+$", path):
             self._sup_update(int(path.split("/")[2]))
-        elif path == "/settings/explain":
-            self._explain_settings_update()
         else:
             self.send_error(404)
 
@@ -286,6 +364,8 @@ class Handler(BaseHTTPRequestHandler):
             self._ti_delete(int(path.split("/")[2]))
         elif re.match(r"^/suppression/\d+$", path):
             self._sup_delete(int(path.split("/")[2]))
+        elif path == "/admin/flush":
+            self._admin_flush()
         else:
             self.send_error(404)
 
@@ -318,7 +398,35 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── Login / logout ────────────────────────────────────────────────────────
 
+    _RATE_WINDOW  = 300   # 5-minute window
+    _RATE_MAX     = 10    # max attempts per window per IP
+
+    def _check_rate_limit(self) -> bool:
+        """Return True (blocked) if this IP has too many recent login failures."""
+        ip  = self.address_string()
+        now = time.time()
+        cutoff = now - self._RATE_WINDOW
+        with self._login_lock:
+            attempts = [t for t in self._login_attempts.get(ip, []) if t > cutoff]
+            self._login_attempts[ip] = attempts
+            return len(attempts) >= self._RATE_MAX
+
+    def _record_failure(self):
+        ip = self.address_string()
+        with self._login_lock:
+            self._login_attempts.setdefault(ip, []).append(time.time())
+
+    def _clear_failures(self):
+        ip = self.address_string()
+        with self._login_lock:
+            self._login_attempts.pop(ip, None)
+
     def _do_login(self):
+        if self._check_rate_limit():
+            log.warning("Login rate-limited for %s", self.address_string())
+            time.sleep(2)
+            self._json({"error": "Too many login attempts. Try again later."}, 429)
+            return
         try:
             n    = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n))
@@ -333,6 +441,7 @@ class Handler(BaseHTTPRequestHandler):
             user = {"username": "admin", "role": "admin"}
 
         if user:
+            self._clear_failures()
             token = self.auth.create_session(username=user["username"], role=user["role"])
             log.info("Login OK  user=%s role=%s from %s",
                      user["username"], user["role"], self.address_string())
@@ -347,6 +456,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(resp)
         else:
+            self._record_failure()
             log.warning("Failed login user=%r from %s",
                         username or "(none)", self.address_string())
             time.sleep(1)
@@ -364,15 +474,31 @@ class Handler(BaseHTTPRequestHandler):
     # ── Data ──────────────────────────────────────────────────────────────────
 
     def _serve_alerts(self, qs):
-        days  = self._qs_int(qs, "days",  RETAIN_DAYS, 1, RETAIN_DAYS)
-        limit = self._qs_int(qs, "limit", 5000, 1, 20000)
-        self._json(self.db.fetch_recent(days=days, limit=limit))
+        days   = self._qs_int(qs, "days",   RETAIN_DAYS, 1, RETAIN_DAYS)
+        limit  = self._qs_int(qs, "limit",  300,  1, 5000)
+        offset = self._qs_int(qs, "offset", 0,    0, 10_000_000)
+        q      = (qs.get("q", [""])[0] or "").strip()
+
+        # Full-database search: bypass pagination cache, query all fields
+        if q:
+            self._json(self.db.search_alerts(
+                q, days=days, limit=limit, offset=offset))
+            return
+
+        # Pass cached total from stats (avoids COUNT(*) on every paginated request)
+        cached_total = None
+        if Handler._stats_cache:
+            cached_total = Handler._stats_cache[0].get("alerts", {}).get("window")
+        self._json(self.db.fetch_recent(days=days, limit=limit, offset=offset,
+                                        _precomputed_total=cached_total))
 
     def _serve_table(self, table, qs):
-        days  = self._qs_int(qs, "days",  RETAIN_DAYS, 1, RETAIN_DAYS)
-        limit = self._qs_int(qs, "limit", 5000, 1, 20000)
+        days   = self._qs_int(qs, "days",   RETAIN_DAYS, 1, RETAIN_DAYS)
+        limit  = self._qs_int(qs, "limit",  300, 1, 5000)
+        offset = self._qs_int(qs, "offset", 0,   0, 10_000_000)
         if table == "dns":
-            self._json(self.dns_db.fetch(days=days, limit=limit)); return
+            self._json(self.dns_db.fetch(days=days, limit=limit, offset=offset))
+            return
         fn = {"flows": self.db.fetch_flows, "http": self.db.fetch_http}.get(table)
         if fn is None:
             self.send_error(404); return
@@ -435,24 +561,38 @@ class Handler(BaseHTTPRequestHandler):
         if not self._require_role("admin"): return
         body = self._read_json()
         if body is None: return
-        name  = str(body.get("name",  "")).strip()
-        wtype = str(body.get("type",  "generic")).strip()
-        url   = str(body.get("url",   "")).strip()
+        name            = str(body.get("name",  "")).strip()
+        wtype           = str(body.get("type",  "generic")).strip()
+        url             = str(body.get("url",   "")).strip()
+        allow_local_ips = bool(body.get("allow_local_ips", False))
         if not name or not url:
             self._json({"error": "name and url are required"}, 400); return
         if wtype not in ("slack", "discord", "generic"):
             self._json({"error": "type must be slack, discord, or generic"}, 400); return
+        from webhooks import validate_webhook_url
+        err = validate_webhook_url(url, allow_local=allow_local_ips)
+        if err:
+            self._json({"error": err}, 400); return
         self._json(self.wdb.create(
             name, wtype, url,
             body.get("severities", ["critical","high","medium","low","info"]),
-            bool(body.get("enabled", True))), 201)
+            bool(body.get("enabled", True)),
+            allow_local_ips), 201)
 
     def _webhook_update(self, wid):
         if not self._require_role("admin"): return
-        if not self.wdb.get(wid):
+        existing = self.wdb.get(wid)
+        if not existing:
             self._json({"error": "Not found"}, 404); return
         body = self._read_json()
         if body is None: return
+        if "url" in body:
+            from webhooks import validate_webhook_url
+            allow_local = bool(body.get("allow_local_ips",
+                               existing.get("allow_local_ips", False)))
+            err = validate_webhook_url(str(body["url"]).strip(), allow_local=allow_local)
+            if err:
+                self._json({"error": err}, 400); return
         self._json(self.wdb.update(wid, **body))
 
     def _webhook_test(self, wid):
@@ -460,6 +600,11 @@ class Handler(BaseHTTPRequestHandler):
         wh = self.wdb.get(wid)
         if not wh:
             self._json({"error": "Not found"}, 404); return
+        from webhooks import validate_webhook_url
+        allow_local = wh.get("allow_local_ips", False)
+        err = validate_webhook_url(wh["url"], allow_local=allow_local)
+        if err:
+            self._json({"error": f"Blocked: {err}"}, 400); return
         from webhooks import build_payload, deliver
         test_alert = {
             "id": "test-0", "ts": "2026-01-01T00:00:00+0000",
@@ -469,7 +614,10 @@ class Handler(BaseHTTPRequestHandler):
             "sig_id": 9999999, "sig_msg": "Watcher Test Alert",
             "category": "Test", "severity": "medium", "action": "allowed",
         }
-        err = deliver(wh["url"], build_payload(wh["type"], test_alert))
+        # BUG FIX: pass allow_local so the delivery respects the
+        # "Allow Local / Private IPs" setting during test calls.
+        err = deliver(wh["url"], build_payload(wh["type"], test_alert),
+                      allow_local=allow_local)
         self._json({"ok": err is None, **({} if not err else {"error": err})})
 
     # ── Users ─────────────────────────────────────────────────────────────────
@@ -500,6 +648,8 @@ class Handler(BaseHTTPRequestHandler):
         pw = str(body.pop("password", "")).strip()
         if pw:
             self.um.set_password(uid, pw)
+            # Invalidate all active sessions for this user so re-login is forced
+            self.auth.revoke_sessions_for_user(user.get("username", ""))
         if body.get("role") and body["role"] not in ("admin", "analyst", "viewer"):
             self._json({"error": "Invalid role"}, 400); return
         if user["role"] == "admin" and self.um.count_admins() <= 1:
@@ -654,10 +804,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "sig_id must be an integer"}, 400); return
 
         if not self.explain_engine.has_key():
+            from explain import PROVIDERS as _AI_P
+            active = self.explain_engine.active_provider()
+            label  = _AI_P.get(active, {}).get("label", active)
+            env_k  = _AI_P.get(active, {}).get("env_key", "API_KEY")
             self._json({"error": "no_key",
-                        "message": "No DeepSeek API key configured. "
-                                   "Add DEEPSEEK_API_KEY to watcher.conf "
-                                   "or set it in Settings → AI Explain."}, 503)
+                        "message": f"No {label} API key configured. "
+                                   f"Add {env_k} to watcher.conf "
+                                    "or set it in Settings → AI Explain."}, 503)
             return
 
         force = bool(body.get("force", False))
@@ -699,3 +853,90 @@ class Handler(BaseHTTPRequestHandler):
             api_key         = api_key,
             target_provider = target_provider,
         ))
+
+    # ── Data Control ──────────────────────────────────────────────────────────
+
+    def _admin_replay(self):
+        """
+        POST /admin/replay
+        Starts a background replay of eve.json from the beginning.
+        Only one replay can run at a time.
+        Returns immediately; poll GET /admin/replay for status.
+        """
+        if not self._require_role("admin"): return
+
+        with Handler._replay_lock:
+            if Handler._replay_state == "running":
+                self._json({"error": "Replay already in progress."}, 409)
+                return
+            Handler._replay_state = "running"
+
+        eve_path      = self.eve_path
+        db            = self.db
+        dns_db        = self.dns_db
+        registry      = self.registry
+        wdb           = self.wdb
+        sup_db        = self.sup_db
+        stats_ref     = Handler
+
+        def _run():
+            from tail import replay_eve
+            try:
+                result = replay_eve(
+                    str(eve_path), db, registry,
+                    wdb=wdb, dns_db=dns_db, sup_db=sup_db,
+                )
+                # Invalidate stats cache so /health reflects new counts
+                with Handler._stats_lock:
+                    stats_ref._stats_cache = None
+            except Exception as exc:
+                result = {"error": str(exc)}
+            with Handler._replay_lock:
+                Handler._replay_state = result
+
+        import threading as _t
+        _t.Thread(target=_run, daemon=True, name="admin-replay").start()
+        self._json({"status": "started"}, 202)
+
+    def _admin_flush(self):
+        """
+        DELETE /admin/flush
+        Wipes all alert, flow, dns, and http records from the database.
+        Admin only. Invalidates the stats cache.
+        """
+        if not self._require_role("admin"): return
+        counts      = self.db.flush_all()
+        dns_deleted = self.dns_db.flush_all() if self.dns_db else 0
+        counts["dns_events"] = dns_deleted
+        # Invalidate stats cache
+        with Handler._stats_lock:
+            Handler._stats_cache = None
+        log.info("Admin flush: %s", counts)
+        self._json({"deleted": counts})
+
+    # ── Threat Intel Import ───────────────────────────────────────────────────
+
+    def _ti_import(self):
+        """POST /threat-intel/import — bulk import from JSON array."""
+        if not self._require_role("admin"): return
+        body = self._read_json()
+        if body is None: return
+
+        entries = body if isinstance(body, list) else body.get("entries", [])
+        if not isinstance(entries, list):
+            self._json({"error": "Expected a JSON array of entries."}, 400)
+            return
+        if len(entries) > 5000:
+            self._json({"error": "Maximum 5,000 entries per import."}, 400)
+            return
+
+        # Identify caller for audit trail
+        token = self.headers.get("Cookie", "")
+        try:
+            tok = token.split("token=")[1].split(";")[0].strip()
+            caller = (self.auth.validate(tok) or {}).get("username", "import")
+        except Exception:
+            caller = "import"
+
+        result = self.ti_db.import_entries(entries, imported_by=caller)
+        self._json(result, 200)

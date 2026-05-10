@@ -5,16 +5,18 @@ Supported providers:
   deepseek  — DeepSeek Chat  (deepseek-chat)
   openai    — OpenAI         (gpt-4o-mini)
   anthropic — Anthropic      (claude-haiku-4-5-20251001)
+  nvidia    — NVIDIA NIM     (deepseek-ai/deepseek-v4-pro)
 
 ExplainDB      : SQLite cache + settings in config.db
 ExplainEngine  : dispatches to the active provider, caches results
 
 Settings stored in the `settings` table (key → value):
   ai_enabled        "1" | "0"           (default "1")
-  ai_provider       "deepseek" | "openai" | "anthropic"  (default "deepseek")
+  ai_provider       "deepseek" | "openai" | "anthropic" | "nvidia"  (default "deepseek")
   deepseek_api_key  DB override (env fallback: DEEPSEEK_API_KEY)
   openai_api_key    DB override (env fallback: OPENAI_API_KEY)
   anthropic_api_key DB override (env fallback: ANTHROPIC_API_KEY)
+  nvidia_api_key    DB override (env fallback: NVIDIA_API_KEY)
 
 Key priority per provider: DB override wins, then env var.
 """
@@ -36,7 +38,7 @@ PROVIDERS = {
         "label":   "DeepSeek",
         "model":   "deepseek-chat",
         "url":     "https://api.deepseek.com/v1/chat/completions",
-        "format":  "openai",          # OpenAI-compatible
+        "format":  "openai",
         "env_key": "DEEPSEEK_API_KEY",
         "db_key":  "deepseek_api_key",
     },
@@ -52,9 +54,17 @@ PROVIDERS = {
         "label":   "Anthropic (Claude)",
         "model":   "claude-haiku-4-5-20251001",
         "url":     "https://api.anthropic.com/v1/messages",
-        "format":  "anthropic",       # different request/response shape
+        "format":  "anthropic",
         "env_key": "ANTHROPIC_API_KEY",
         "db_key":  "anthropic_api_key",
+    },
+    "nvidia": {
+        "label":   "NVIDIA NIM",
+        "model":   "deepseek-ai/deepseek-v4-pro",
+        "url":     "https://integrate.api.nvidia.com/v1/chat/completions",
+        "format":  "openai",          # NIM is OpenAI-compatible
+        "env_key": "NVIDIA_API_KEY",
+        "db_key":  "nvidia_api_key",
     },
 }
 

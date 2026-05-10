@@ -52,14 +52,18 @@ class AlertDB:
                 ack_status TEXT NOT NULL DEFAULT 'new',
                 ack_note TEXT, ack_by TEXT, ack_at REAL)""")
 
-            c.execute("CREATE INDEX IF NOT EXISTS idx_a_ts      ON alerts (ts_epoch)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_a_sev     ON alerts (severity)")
-            # Composite: accelerates time-range + severity filters together
+            # Composite (ts_epoch, severity): accelerates time-range + severity filters;
+            # also serves as the ts_epoch-only index so we don't need a separate one.
             c.execute("CREATE INDEX IF NOT EXISTS idx_a_ts_sev  ON alerts (ts_epoch, severity)")
-            # sig_id: used by top_sids() GROUP BY and auto-explain lookup
+            # sig_id: used by top_sids() GROUP BY and threat-intel lookups
             c.execute("CREATE INDEX IF NOT EXISTS idx_a_sig_id  ON alerts (sig_id)")
             # ack_status: used by bulk-ack filters and status views
             c.execute("CREATE INDEX IF NOT EXISTS idx_a_ack     ON alerts (ack_status)")
+            # src_ip: used by top_talkers() GROUP BY (charts hot path)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_a_src_ip  ON alerts (src_ip)")
+            # dst_ip: used by destination-IP search queries
+            c.execute("CREATE INDEX IF NOT EXISTS idx_a_dst_ip  ON alerts (dst_ip)")
 
             # Migration: add ack columns to existing databases
             alert_cols = {r[1] for r in c.execute("PRAGMA table_info(alerts)").fetchall()}
@@ -143,20 +147,34 @@ class AlertDB:
         except sqlite3.Error as e:
             log.warning("DB insert (alert): %s", e)
 
-    def fetch_recent(self, days=None, limit=5000, include_raw=False):
+    def fetch_recent(self, days=None, limit=300, offset=0, include_raw=False, **kwargs):
         """
-        Fetch recent alerts.  raw_json is expensive to deserialize for thousands
-        of rows — it is omitted by default and only returned when include_raw=True
-        (used by the single-alert raw detail view).
+        Fetch paginated alerts newest-first.
+        Returns { "rows": [...], "total": <int> }
+
+        raw_json is omitted by default — only fetched on the Raw tab via fetch_raw().
+        offset + limit implement cursor-style pagination for "Load more".
         """
         cutoff = time.time() - (days or self.retain_days) * 86400
+        conn   = self._conn()
+
+        # Total is served from the /health stats cache (updated every 5s).
+        # We pass it through from the handler to avoid a redundant COUNT(*) here.
+        # For direct callers that don't pass total, fall back to a live count.
+        total = kwargs.pop("_precomputed_total", None)
+        if total is None:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM alerts WHERE ts_epoch >= ?", (cutoff,)
+            ).fetchone()[0]
+
         if include_raw:
-            rows = self._conn().execute(
+            rows = conn.execute(
                 """SELECT id,ts,src_ip,src_port,dst_ip,dst_port,proto,iface,
                           flow_id,sig_id,sig_msg,category,severity,action,raw_json,
                           ack_status,ack_note,ack_by,ack_at
-                   FROM alerts WHERE ts_epoch>=? ORDER BY ts_epoch DESC LIMIT ?""",
-                (cutoff, limit)).fetchall()
+                   FROM alerts WHERE ts_epoch>=?
+                   ORDER BY ts_epoch DESC LIMIT ? OFFSET ?""",
+                (cutoff, limit, offset)).fetchall()
             result = []
             for row in rows:
                 d = dict(row)
@@ -165,15 +183,32 @@ class AlertDB:
                 except Exception:
                     d["raw"] = {}
                 result.append(d)
-            return result
+            return {"rows": result, "total": total}
         else:
-            rows = self._conn().execute(
+            rows = conn.execute(
                 """SELECT id,ts,src_ip,src_port,dst_ip,dst_port,proto,iface,
                           flow_id,sig_id,sig_msg,category,severity,action,
                           ack_status,ack_note,ack_by,ack_at
-                   FROM alerts WHERE ts_epoch>=? ORDER BY ts_epoch DESC LIMIT ?""",
-                (cutoff, limit)).fetchall()
-            return [dict(r) for r in rows]
+                   FROM alerts WHERE ts_epoch>=?
+                   ORDER BY ts_epoch DESC LIMIT ? OFFSET ?""",
+                (cutoff, limit, offset)).fetchall()
+            return {"rows": [dict(r) for r in rows], "total": total}
+
+    def flush_all(self) -> dict:
+        """
+        Delete every event record — alerts, flows, http_events.
+        Returns counts of deleted rows per table.
+        Admin-only operation, called from Data Control panel.
+        """
+        c = self._conn()
+        counts = {}
+        for tbl in ("alerts", "flows", "http_events"):
+            cur = c.execute(f"DELETE FROM {tbl}")
+            counts[tbl] = cur.rowcount
+        c.commit()
+        # Reset the stats cache so /health reflects the empty state immediately
+        log.info("Flush all: %s", counts)
+        return counts
 
     def fetch_raw(self, alert_id: str) -> dict | None:
         """Return the raw_json blob for a single alert — used by the detail Raw tab."""
@@ -186,6 +221,61 @@ class AlertDB:
             return json.loads(row[0] or "{}")
         except Exception:
             return {}
+
+    def search_alerts(self, q: str, days=None, limit: int = 300,
+                      offset: int = 0) -> dict:
+        """
+        Full-database alert search across sig_id, src_ip, dst_ip, sig_msg,
+        and category.  Mirrors the client-side filter for consistency.
+
+        Performance notes:
+          • Numeric queries use ``sig_id = ?`` (idx_a_sig_id, O(log n)) as the
+            primary SID path.  The remaining OR arms fall back to LIKE scans, but
+            the integer arm short-circuits most of the time.
+          • Text queries skip the expensive CAST on sig_id entirely.
+          • Leading-wildcard LIKE (%%q%%) cannot use B-tree indexes on the text
+            columns; those arms are O(n).  For large deployments (>500k rows),
+            keep the retention window short or consider FTS5.
+
+        Returns { "rows": [...], "total": <int>, "query": <str> }
+        """
+        cutoff = time.time() - (days or self.retain_days) * 86400
+        conn   = self._conn()
+        q_lo   = q.strip().lower()
+        pct    = f"%{q_lo}%"
+
+        if q_lo.isdigit():
+            # Numeric: exact SID first (index-backed), then text fields as fallback.
+            # Avoids CAST-on-every-row for non-SID digits like IP octets.
+            where   = ("AND (sig_id = ? "
+                       "OR src_ip LIKE ? OR dst_ip LIKE ? "
+                       "OR LOWER(sig_msg) LIKE ? OR LOWER(category) LIKE ?)")
+            wparams = [int(q_lo), pct, pct, pct, pct]
+        else:
+            # Text: IP substrings, signature message, category — no sig_id CAST.
+            where   = ("AND (src_ip LIKE ? OR dst_ip LIKE ? "
+                       "OR LOWER(sig_msg) LIKE ? OR LOWER(category) LIKE ?)")
+            wparams = [pct, pct, pct, pct]
+
+        base  = [cutoff, *wparams]
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM alerts WHERE ts_epoch >= ? {where}", base
+        ).fetchone()[0]
+
+        rows = conn.execute(
+            f"""SELECT id,ts,src_ip,src_port,dst_ip,dst_port,proto,iface,
+                       flow_id,sig_id,sig_msg,category,severity,action,
+                       ack_status,ack_note,ack_by,ack_at
+                FROM alerts WHERE ts_epoch >= ? {where}
+                ORDER BY ts_epoch DESC LIMIT ? OFFSET ?""",
+            [*base, limit, offset],
+        ).fetchall()
+
+        return {
+            "rows":  [dict(r) for r in rows],
+            "total": total,
+            "query": q,
+        }
 
     # ── Flows ─────────────────────────────────────────────────────────────────
 
@@ -499,11 +589,23 @@ class AlertDB:
         def _recent(t): return c.execute(self._RECENT_SQL[t], (cutoff,)).fetchone()[0]
 
         oldest = c.execute("SELECT MIN(ts) FROM alerts").fetchone()[0]
+        # Most recently seen interface from eve.json (in_iface field)
+        iface_row = c.execute(
+            "SELECT iface FROM alerts WHERE iface != '' ORDER BY ts_epoch DESC LIMIT 1"
+        ).fetchone()
+        # Total alert count within retention window — cached here so
+        # fetch_recent() doesn't re-run COUNT(*) on every paginated request
+        cutoff_alerts = time.time() - self.retain_days * 86400
+        alerts_total  = c.execute(
+            "SELECT COUNT(*) FROM alerts WHERE ts_epoch >= ?", (cutoff_alerts,)
+        ).fetchone()[0]
         return {
-            "alerts": {"total": _cnt("alerts"),     "recent": _recent("alerts")},
+            "alerts": {"total": _cnt("alerts"),     "recent": _recent("alerts"),
+                       "window": alerts_total},
             "flows":  {"total": _cnt("flows"),       "recent": _recent("flows")},
             "http":   {"total": _cnt("http_events"), "recent": _recent("http_events")},
             "oldest": oldest,
+            "iface":  iface_row[0] if iface_row else None,
         }
 
     def top_sids(self, limit: int = 50) -> list[dict]:

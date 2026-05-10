@@ -157,8 +157,6 @@ def tail_thread(path: str, db, registry, wdb=None, dns_db=None, sup_db=None,
       for new sig_ids in the background (one call per unique SID, cached).
     """
     # Track which sig_ids we have already queued for auto-explain this session.
-    # On restart the DB cache is checked first, so this just avoids redundant
-    # thread spawns within a single run.
     _explained_sids: set = set()
     log.info("Tailing %s", path)
 
@@ -229,6 +227,69 @@ def purge_thread(db, auth, dns_db=None):
         auth.purge_expired()
         if dns_db is not None:
             dns_db.purge_old()
+        # Checkpoint WAL files after purge so they don't grow unbounded
+        try:
+            db._conn().execute("PRAGMA wal_checkpoint(PASSIVE)")
+            if dns_db is not None:
+                dns_db._conn().execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:
+            pass
+
+def replay_eve(path: str, db, registry, wdb=None,
+               dns_db=None, sup_db=None,
+               progress_cb=None) -> dict:
+    """
+    Read eve.json from the beginning and insert every event into the DB.
+    Existing records are skipped (upsert-on-conflict by ts+flow_id).
+    Called by the admin Data Control panel — runs in a background thread.
+
+    progress_cb: optional callable(inserted, skipped, total_lines) for status updates.
+    Returns { inserted, skipped, errors, lines }.
+    """
+    inserted = skipped = errors = lines = 0
+    log.info("Replay started: %s", path)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                lines += 1
+                etype, parsed = parse_eve_line(raw)
+                if etype is None:
+                    continue
+                try:
+                    if etype == "alert":
+                        if sup_db and sup_db.is_suppressed(parsed):
+                            skipped += 1
+                        else:
+                            db.insert(parsed)
+                            registry.broadcast("alert", parsed)
+                            if wdb:
+                                _webhook_dispatch(parsed, wdb)
+                            inserted += 1
+                    elif etype == "flow":
+                        db.insert_flow(parsed); inserted += 1
+                    elif etype == "dns":
+                        if dns_db:
+                            dns_db.insert(parsed)
+                        else:
+                            db.insert_dns(parsed)
+                        inserted += 1
+                    elif etype == "http":
+                        db.insert_http(parsed); inserted += 1
+                    if progress_cb and lines % 1000 == 0:
+                        progress_cb(inserted, skipped, lines)
+                except Exception as exc:
+                    log.warning("Replay line %d error: %s", lines, exc)
+                    errors += 1
+    except OSError as exc:
+        log.error("Replay failed to open %s: %s", path, exc)
+        return {"inserted": inserted, "skipped": skipped,
+                "errors": errors + 1, "lines": lines}
+
+    log.info("Replay complete: %d lines, %d inserted, %d skipped, %d errors.",
+             lines, inserted, skipped, errors)
+    return {"inserted": inserted, "skipped": skipped,
+            "errors": errors, "lines": lines}
+
 
 def _auto_explain(alert: dict, engine, seen: set) -> None:
     """

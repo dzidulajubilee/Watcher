@@ -21,6 +21,9 @@ export default function App() {
   const [sparkData,    setSparkData]    = useState(new Array(30).fill(0));
   const [rate,         setRate]         = useState(0);
   const [historyCount, setHistoryCount] = useState(0);
+  const [totalAlerts,  setTotalAlerts]  = useState(0);
+  const [loadingMore,  setLoadingMore]  = useState(false);
+  const offsetRef = useRef(0);   // tracks how many alerts loaded so far
   const [showConfirm,  setShowConfirm]  = useState(false);
   const [clearing,     setClearing]     = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -34,6 +37,9 @@ export default function App() {
   const [dnsEvents,    setDnsEvents]    = useState([]);
   const [flowSel,      setFlowSel]      = useState(null);
   const [dnsSel,       setDnsSel]       = useState(null);
+  const [totalDns,     setTotalDns]     = useState(0);
+  const [loadingMoreDns, setLoadingMoreDns] = useState(false);
+  const dnsOffsetRef = useRef(0);
   const [evtLoading,   setEvtLoading]   = useState(false);
   const [currentUser,  setCurrentUser]  = useState('');
   const [role,         setRole]         = useState('admin');
@@ -44,6 +50,8 @@ export default function App() {
   const [showExplain,  setShowExplain]  = useState(false);
   // AI enabled state — fetched once, passed to ExplainDialog (avoids per-click fetch)
   const [aiEnabled,    setAiEnabled]    = useState(null);
+  const [iface,        setIface]        = useState(null);
+  const [engineStatus, setEngineStatus] = useState('unknown');  // 'running'|'idle'|'stopped'|'unknown'
 
   const pausedRef    = useRef(false);
   const accumRef     = useRef(0);
@@ -78,24 +86,62 @@ export default function App() {
       .then(r => r.json())
       .then(d => setAiEnabled(d.enabled ?? true))
       .catch(() => setAiEnabled(false));
+    // interface + engine status handled by the 15s poll below
   }, []);
 
-  // ── Load alert history ─────────────────────────────────────────────────────
-  useEffect(() => {
-    fetch('/alerts?limit=5000')
+  // ── Load alert history (paginated, 300 per page) ──────────────────────────
+  function loadAlerts(offset = 0, append = false) {
+    if (append) setLoadingMore(true);
+    fetch(`/alerts?limit=300&offset=${offset}`)
       .then(r => {
         if (r.status === 401) { window.location.href = '/login'; throw new Error(); }
         return r.json();
       })
-      .then(rows => {
-        if (!Array.isArray(rows)) return;
+      .then(data => {
+        // API now returns { rows: [...], total: N }
+        const rows  = Array.isArray(data) ? data : (data.rows || []);
+        const total = data.total ?? rows.length;
         const loaded = rows.map(r => ({ ...r, tsStr: fmtTime(r.ts) }));
-        alertIdsRef.current = new Set(loaded.map(r => r.id));
-        setAlerts(loaded);
-        setHistoryCount(loaded.length);
+        if (append) {
+          setAlerts(prev => {
+            loaded.forEach(r => alertIdsRef.current.add(r.id));
+            return [...prev, ...loaded];
+          });
+        } else {
+          alertIdsRef.current = new Set(loaded.map(r => r.id));
+          setAlerts(loaded);
+          setHistoryCount(loaded.length);
+        }
+        setTotalAlerts(total);
+        offsetRef.current = offset + loaded.length;
+        if (append) setLoadingMore(false);
       })
-      .catch(() => {});
-  }, []);
+      .catch(() => { if (append) setLoadingMore(false); });
+  }
+
+  useEffect(() => { loadAlerts(0, false); }, []);
+
+  // ── DNS pagination ────────────────────────────────────────────────────────
+  function loadDns(offset = 0, append = false) {
+    if (append) setLoadingMoreDns(true);
+    else setEvtLoading(true);
+    fetch(`/dns?limit=300&offset=${offset}`)
+      .then(r => r.json())
+      .then(data => {
+        const rows  = Array.isArray(data) ? data : (data.rows || []);
+        const total = data.total ?? rows.length;
+        if (append) {
+          setDnsEvents(prev => [...prev, ...rows]);
+        } else {
+          setDnsEvents(rows);
+        }
+        setTotalDns(total);
+        dnsOffsetRef.current = offset + rows.length;
+        if (append) setLoadingMoreDns(false);
+        else setEvtLoading(false);
+      })
+      .catch(() => { setEvtLoading(false); setLoadingMoreDns(false); });
+  }
 
   // ── Load flows / dns on first visit to that view ───────────────────────────
   useEffect(() => {
@@ -106,13 +152,7 @@ export default function App() {
         setEvtLoading(false);
       }).catch(() => setEvtLoading(false));
     }
-    if (activeView === 'dns' && dnsEvents.length === 0) {
-      setEvtLoading(true);
-      fetch('/dns?limit=5000').then(r => r.json()).then(d => {
-        if (Array.isArray(d)) setDnsEvents(d.map(r => ({ ...r, tsStr: fmtTime(r.ts) })));
-        setEvtLoading(false);
-      }).catch(() => setEvtLoading(false));
-    }
+    if (activeView === 'dns' && dnsEvents.length === 0) { loadDns(0, false); }
   }, [activeView]);
 
   // ── SSE connection ─────────────────────────────────────────────────────────
@@ -134,6 +174,7 @@ export default function App() {
           accumRef.current++;
           newIdsRef.current.add(evt.id);
           setTimeout(() => newIdsRef.current.delete(evt.id), 400);
+          if (evt.iface) setIface(evt.iface);
           if (alertIdsRef.current.has(evt.id)) return;
           alertIdsRef.current.add(evt.id);
           setAlerts(prev => {
@@ -188,6 +229,22 @@ export default function App() {
   }, []);
 
   useEffect(() => { pausedRef.current = paused; }, [paused]);
+
+  // ── Engine status poll (every 15 s) ─────────────────────────────────────────
+  useEffect(() => {
+    function checkEngine() {
+      fetch('/health')
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+          if (d?.engine?.status) setEngineStatus(d.engine.status);
+          if (d?.db?.iface)      setIface(d.db.iface);
+        })
+        .catch(() => setEngineStatus('stopped'));
+    }
+    checkEngine();                          // immediate check on mount
+    const id = setInterval(checkEngine, 15_000);
+    return () => clearInterval(id);
+  }, []);
 
   // ── Sparkline ticker ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -255,7 +312,7 @@ export default function App() {
   async function handleClearAlerts() {
     setClearing(true);
     try { await fetch('/alerts', { method:'DELETE' }); } catch {}
-    setAlerts([]); setSelected(null); setHistoryCount(0);
+    setAlerts([]); setSelected(null); setHistoryCount(0); setTotalAlerts(0); offsetRef.current = 0;
     setClearing(false); setShowConfirm(false);
   }
 
@@ -281,7 +338,7 @@ export default function App() {
   };
 
   const handleClearDns = async () => {
-    try { await fetch('/dns', { method:'DELETE' }); setDnsEvents([]); setDnsSel(null); }
+    try { await fetch('/dns', { method:'DELETE' }); setDnsEvents([]); setDnsSel(null); setTotalDns(0); dnsOffsetRef.current = 0; }
     catch { alert('Failed to clear DNS events'); }
   };
 
@@ -350,8 +407,17 @@ export default function App() {
           </span>
         </div>
         <div className="sep"/>
-        <div className="pill">Interface: <b style={{ marginLeft:4 }}>eth0</b></div>
-        <div className="pill">Engine: <b style={{ marginLeft:4, color:'var(--green)' }}>Running</b></div>
+        <div className="pill">Interface: <b style={{ marginLeft:4 }}>{iface || "—"}</b></div>
+        <div className="pill">Engine:{' '}
+          <b style={{ marginLeft:4, color:
+            engineStatus === 'running' ? 'var(--green)'  :
+            engineStatus === 'idle'    ? 'var(--yellow)' :
+            engineStatus === 'stopped' ? 'var(--red)'    : 'var(--text3)' }}>
+            {engineStatus === 'running' ? 'Running' :
+             engineStatus === 'idle'    ? 'Idle'    :
+             engineStatus === 'stopped' ? 'Stopped' : '—'}
+          </b>
+        </div>
         {role !== 'admin' && (
           <div className="pill" style={{ borderColor:'var(--yellow)', background:'var(--yellow-d)' }}>
             <span style={{ color:'var(--yellow)', fontWeight:500, letterSpacing:'.04em' }}>
@@ -516,11 +582,13 @@ export default function App() {
             <div className="pane-head">
               <span className="pane-title">Alert Stream</span>
               <span className="pane-cnt">{filtered.length.toLocaleString()}</span>
-              {historyCount > 0 && (
-                <span style={{ fontSize:10, fontFamily:'var(--mono)', color:'var(--text3)',
+              {totalAlerts > 0 && (
+                <span style={{ fontSize:10, fontFamily:'var(--mono)',
+                               color: alerts.length < totalAlerts ? 'var(--yellow)' : 'var(--text3)',
                                background:'var(--bg2)', border:'1px solid var(--border)',
-                               padding:'1px 7px', borderRadius:10 }}>
-                  {historyCount.toLocaleString()} stored
+                               padding:'1px 7px', borderRadius:10,
+                               title:`${alerts.length} loaded of ${totalAlerts} total` }}>
+                  {alerts.length.toLocaleString()} / {totalAlerts.toLocaleString()}
                 </span>
               )}
               <div className="pane-actions">
@@ -656,6 +724,30 @@ export default function App() {
                   </tbody>
                 </table>
               )}
+
+              {/* ── Load More ── */}
+              {alerts.length < totalAlerts && (
+                <div style={{
+                  padding:'10px 0', textAlign:'center',
+                  borderTop:'1px solid var(--border)',
+                  background:'var(--bg1)',
+                }}>
+                  <button
+                    onClick={() => loadAlerts(offsetRef.current, true)}
+                    disabled={loadingMore}
+                    style={{
+                      background:'var(--bg2)', border:'1px solid var(--border2)',
+                      color:'var(--text2)', fontFamily:'var(--mono)', fontSize:11,
+                      padding:'5px 18px', borderRadius:'var(--radius-md)',
+                      cursor: loadingMore ? 'default' : 'pointer',
+                      opacity: loadingMore ? 0.6 : 1, transition:'opacity .15s',
+                    }}>
+                    {loadingMore
+                      ? 'Loading…'
+                      : `Load more  (${(totalAlerts - alerts.length).toLocaleString()} remaining)`}
+                  </button>
+                </div>
+              )}
             </div>
           </div>
 
@@ -700,6 +792,8 @@ export default function App() {
         <main className="main">
           <div className="content" style={{ gridTemplateColumns:'1fr 310px' }}>
             <DNSView rows={dnsEvents} loading={evtLoading} selected={dnsSel}
+                     totalDns={totalDns} loadingMore={loadingMoreDns}
+                     onLoadMore={() => loadDns(dnsOffsetRef.current, true)}
                      onSelect={setDnsSel} onClear={handleClearDns}/>
             <div className="detail">
               <div className="pane-head"><span className="pane-title">DNS Detail</span></div>
@@ -748,7 +842,7 @@ export default function App() {
             <div style={{ fontSize:15, fontWeight:500, marginBottom:10 }}>Clear all alerts?</div>
             <div style={{ fontSize:12, color:'var(--text2)', lineHeight:1.7, marginBottom:24 }}>
               This will permanently delete{' '}
-              <b style={{ color:'var(--text1)' }}>{(historyCount || alerts.length).toLocaleString()} stored alerts</b>{' '}
+              <b style={{ color:'var(--text1)' }}>{(totalAlerts || alerts.length).toLocaleString()} stored alerts</b>{' '}
               from the database. This action cannot be undone.
             </div>
             <div style={{ display:'flex', gap:10, justifyContent:'flex-end' }}>

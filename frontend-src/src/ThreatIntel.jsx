@@ -6,7 +6,7 @@ const SEV_COLORS = {
 };
 
 // ── provider accent colours (mirrors Settings.jsx PROVIDER_META) ─────────────
-const PROVIDER_COLOR = { deepseek: '#4D6BFE', openai: '#10A37F', anthropic: '#D4793B' };
+const PROVIDER_COLOR = { deepseek: '#4D6BFE', openai: '#10A37F', anthropic: '#D4793B', nvidia: '#76B900' };
 
 // ── ExplainDialog — pops up when user clicks Explain on a selected alert ──────
 export function ExplainDialog({ alert, role, aiEnabled: aiEnabledProp, onClose }) {
@@ -55,7 +55,7 @@ export function ExplainDialog({ alert, role, aiEnabled: aiEnabledProp, onClose }
         sig_id:   alert.sig_id,
         sig_msg:  alert.sig_msg,
         src_ip:   alert.src_ip,
-        dest_ip:  alert.dest_ip,
+        dest_ip:  alert.dst_ip,
         proto:    alert.proto,
         category: alert.category,
         severity: alert.severity,
@@ -173,8 +173,8 @@ export function ExplainDialog({ alert, role, aiEnabled: aiEnabledProp, onClose }
                   borderRadius: 'var(--radius-md)', padding: '12px 14px',
                   color: 'var(--red)', fontSize: 12, lineHeight: 1.6, marginBottom: 12,
                 }}>
-                  {aiError.includes('no_key') || aiError.includes('API key')
-                    ? 'No DeepSeek API key configured. Summaries are generated automatically once a key is set in Settings → AI Explain.'
+                  {aiError.startsWith('no_key:')
+                    ? aiError.replace('no_key: ', '') + ' Summaries are generated automatically once a key is set in Settings → AI Explain.'
                     : aiError}
                 </div>
                 <button className="btn" onClick={() => fetchAi(false)}
@@ -192,11 +192,11 @@ export function ExplainDialog({ alert, role, aiEnabled: aiEnabledProp, onClose }
                   <span style={{
                     fontSize: 9, fontFamily: 'var(--mono)', letterSpacing: '.08em',
                     textTransform: 'uppercase', padding: '2px 8px', borderRadius: 20,
-                    background: aiData.cached ? 'var(--bg3)' : 'rgba(79,156,249,.12)',
-                    color:      aiData.cached ? 'var(--text3)' : 'var(--accent)',
-                    border:     aiData.cached ? '1px solid var(--border)' : '1px solid rgba(79,156,249,.25)',
+                    background: aiData.cached ? 'rgba(52,199,89,.1)' : 'rgba(79,156,249,.12)',
+                    color:      aiData.cached ? 'var(--green)'       : 'var(--accent)',
+                    border:     aiData.cached ? '1px solid rgba(52,199,89,.25)' : '1px solid rgba(79,156,249,.25)',
                   }}>
-                    {aiData.cached ? 'Cached' : 'Fresh'}
+                    {aiData.cached ? '✓ Saved' : '⚡ Generated'}
                   </span>
                   <span style={{ fontSize: 10, color: 'var(--text3)', fontFamily: 'var(--mono)' }}>
                     {fmtAge(aiData.generated_at)} · {aiData.model}
@@ -208,17 +208,26 @@ export function ExplainDialog({ alert, role, aiEnabled: aiEnabledProp, onClose }
                       }}/>
                     )}
                   </span>
-                  {(role === 'admin' || role === 'analyst') && (
-                    <button onClick={() => fetchAi(true)} style={{
-                      marginLeft: 'auto', background: 'none', border: 'none',
-                      color: 'var(--text3)', fontSize: 11, cursor: 'pointer',
-                      fontFamily: 'var(--mono)', padding: '2px 6px',
-                      borderRadius: 4, transition: 'color .15s',
-                    }} onMouseOver={e => e.target.style.color='var(--text1)'}
-                       onMouseOut={e  => e.target.style.color='var(--text3)'}>
-                      ↺ Regenerate
-                    </button>
-                  )}
+                  <div style={{ marginLeft:'auto', display:'flex', gap:6, alignItems:'center' }}>
+                    {!aiData.cached && (
+                      <span style={{
+                        fontSize:9, fontFamily:'var(--mono)', color:'var(--green)',
+                        padding:'2px 6px', borderRadius:4,
+                        background:'rgba(52,199,89,.08)', border:'1px solid rgba(52,199,89,.2)',
+                      }}>✓ Auto-saved</span>
+                    )}
+                    {(role === 'admin' || role === 'analyst') && (
+                      <button onClick={() => fetchAi(true)} style={{
+                        background: 'none', border: 'none',
+                        color: 'var(--text3)', fontSize: 11, cursor: 'pointer',
+                        fontFamily: 'var(--mono)', padding: '2px 6px',
+                        borderRadius: 4, transition: 'color .15s',
+                      }} onMouseOver={e => e.target.style.color='var(--text1)'}
+                         onMouseOut={e  => e.target.style.color='var(--text3)'}>
+                        ↺ Regenerate
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 {/* Explanation body */}
@@ -235,8 +244,14 @@ export function ExplainDialog({ alert, role, aiEnabled: aiEnabledProp, onClose }
                     marginTop: 16, paddingTop: 12,
                     borderTop: '1px solid var(--border)',
                     fontSize: 10, color: 'var(--text3)', fontFamily: 'var(--mono)',
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                   }}>
-                    {aiData.prompt_tokens} prompt + {aiData.completion_tokens} completion tokens
+                    <span>{aiData.prompt_tokens} prompt + {aiData.completion_tokens} completion tokens</span>
+                    <span style={{ color:'var(--text3)', fontSize:9 }}>
+                      {aiData.cached
+                        ? 'Loaded from saved explanation'
+                        : 'Explanation saved — next click loads instantly'}
+                    </span>
                   </div>
                 )}
               </div>
@@ -561,6 +576,12 @@ export function ThreatIntelPanel({ role }) {
   const [editing,  setEditing]  = useState(null);
   const [delId,    setDelId]    = useState(null);
   const [tab,      setTab]      = useState('entries');
+  // Import/Export state
+  const [importFile,    setImportFile]    = useState(null);
+  const [importParsed,  setImportParsed]  = useState(null);  // parsed JSON array
+  const [importError,   setImportError]   = useState(null);
+  const [importResult,  setImportResult]  = useState(null);
+  const [importing,     setImporting]     = useState(false);
 
   function load() {
     setLoading(true);
@@ -604,6 +625,7 @@ export function ThreatIntelPanel({ role }) {
                       padding: 2 }}>
           {tabBtn('entries', 'Explanations', entries.length)}
           {tabBtn('gaps',    'Coverage Gaps', gaps.length)}
+          {tabBtn('io', '↑↓ Import / Export')}
         </div>
         {(role === 'admin' || role === 'analyst') && (
           <button onClick={() => { setEditing(null); setShowForm(true); }} style={{
@@ -760,6 +782,204 @@ export function ThreatIntelPanel({ role }) {
               </div>
             ))}
           </>
+        )}
+
+        {/* ── Import / Export tab ── */}
+        {tab === 'io' && (
+          <div style={{ maxWidth: 600 }}>
+
+            {/* ── Export ── */}
+            <div style={{ marginBottom: 24 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text1)', marginBottom: 8 }}>
+                Export
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text2)', lineHeight: 1.7, marginBottom: 12 }}>
+                Download all {entries.length} threat intel entries as a <code style={{ fontFamily:'var(--mono)', fontSize:11 }}>.json</code> file.
+                The file can be re-imported into any Watcher instance.
+              </div>
+              <a href="/threat-intel/export" download="watcher-threat-intel.json">
+                <button style={{
+                  display: 'flex', alignItems: 'center', gap: 7,
+                  padding: '7px 16px', borderRadius: 'var(--radius-md)',
+                  background: 'var(--accent-d)', border: '1px solid var(--accent)',
+                  color: 'var(--accent)', fontSize: 12, cursor: 'pointer',
+                  fontFamily: 'var(--mono)',
+                }}>
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+                       stroke="currentColor" strokeWidth="2">
+                    <path d="M8 2v8M4 10l4 4 4-4"/><line x1="2" y1="15" x2="14" y2="15"/>
+                  </svg>
+                  Export {entries.length} {entries.length === 1 ? 'entry' : 'entries'} (.json)
+                </button>
+              </a>
+            </div>
+
+            <div style={{ height: 1, background: 'var(--border)', marginBottom: 24 }}/>
+
+            {/* ── Import ── */}
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text1)', marginBottom: 8 }}>
+                Import
+              </div>
+
+              {/* Format guide */}
+              <div style={{
+                marginBottom: 14, padding: '12px 14px', fontSize: 11,
+                background: 'rgba(79,156,249,.06)', border: '1px solid rgba(79,156,249,.18)',
+                borderRadius: 'var(--radius-md)', lineHeight: 1.8,
+              }}>
+                <div style={{ fontWeight: 600, color: 'var(--accent)', marginBottom: 6, fontSize: 12 }}>
+                  📋 File format guide
+                </div>
+                <div style={{ color: 'var(--text2)' }}>
+                  The file must be a <b>.json</b> file containing an array of objects.
+                  Each object may have:
+                </div>
+                <div style={{ marginTop: 8, fontFamily: 'var(--mono)', fontSize: 10,
+                              color: 'var(--text1)', background: 'var(--bg2)',
+                              padding: '8px 10px', borderRadius: 6, lineHeight: 1.9 }}>
+                  {`[
+  {
+    "sig_id":      2100498,          ← Suricata SID (optional)
+    "sig_msg":     "GPL ATTACK ...", ← Signature name (optional)
+    "category":    "Web Attack",    ← Category (optional)
+    "explanation": "This fires …",  ← Required
+    "tags":        ["web","sqli"],  ← Array of tags (optional)
+    "refs":        ["https://…"]   ← Reference URLs (optional)
+  }
+]`}
+                </div>
+                <div style={{ marginTop: 8, color: 'var(--text3)', fontSize: 10 }}>
+                  ⚠ Each entry needs at least <b>sig_id</b> or <b>category</b> — and must have an <b>explanation</b>.
+                  If a matching entry already exists it will be <b>updated</b>, not duplicated.
+                </div>
+              </div>
+
+              {/* File picker */}
+              {role === 'admin' && (<>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+                  <label style={{
+                    display: 'flex', alignItems: 'center', gap: 7, cursor: 'pointer',
+                    padding: '7px 14px', borderRadius: 'var(--radius-md)',
+                    background: 'var(--bg2)', border: '1px solid var(--border2)',
+                    color: 'var(--text2)', fontSize: 12, fontFamily: 'var(--mono)',
+                    transition: 'border-color .15s',
+                  }}
+                  onMouseEnter={e => e.currentTarget.style.borderColor='var(--accent)'}
+                  onMouseLeave={e => e.currentTarget.style.borderColor='var(--border2)'}>
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none"
+                         stroke="currentColor" strokeWidth="2">
+                      <path d="M8 10V2M4 6l4-4 4 4"/><line x1="2" y1="15" x2="14" y2="15"/>
+                    </svg>
+                    {importFile ? importFile.name : 'Choose .json file…'}
+                    <input type="file" accept=".json,application/json"
+                      style={{ display: 'none' }}
+                      onChange={e => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        setImportFile(file);
+                        setImportError(null);
+                        setImportResult(null);
+                        setImportParsed(null);
+                        const reader = new FileReader();
+                        reader.onload = ev => {
+                          try {
+                            const parsed = JSON.parse(ev.target.result);
+                            if (!Array.isArray(parsed)) throw new Error('File must contain a JSON array.');
+                            setImportParsed(parsed);
+                            setImportError(null);
+                          } catch (err) {
+                            setImportError(`Parse error: ${err.message}`);
+                            setImportParsed(null);
+                          }
+                        };
+                        reader.readAsText(file);
+                      }}/>
+                  </label>
+                  {importParsed && (
+                    <span style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--green)' }}>
+                      ✓ {importParsed.length} {importParsed.length === 1 ? 'entry' : 'entries'} ready
+                    </span>
+                  )}
+                </div>
+
+                {importError && (
+                  <div style={{
+                    marginBottom: 12, padding: '8px 12px', fontSize: 11,
+                    fontFamily: 'var(--mono)', color: 'var(--red)',
+                    background: 'rgba(240,84,84,.08)', border: '1px solid rgba(240,84,84,.2)',
+                    borderRadius: 'var(--radius-md)',
+                  }}>{importError}</div>
+                )}
+
+                {importParsed && (
+                  <button
+                    onClick={() => {
+                      setImporting(true); setImportResult(null);
+                      fetch('/threat-intel/import', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(importParsed),
+                      })
+                        .then(r => r.json())
+                        .then(d => {
+                          setImportResult(d);
+                          setImporting(false);
+                          if ((d.imported || 0) + (d.updated || 0) > 0) load();
+                        })
+                        .catch(() => {
+                          setImportError('Network error during import.');
+                          setImporting(false);
+                        });
+                    }}
+                    disabled={importing}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 7,
+                      padding: '7px 16px', borderRadius: 'var(--radius-md)',
+                      background: importing ? 'var(--bg2)' : 'rgba(52,199,89,.12)',
+                      border: `1px solid ${importing ? 'var(--border)' : 'rgba(52,199,89,.3)'}`,
+                      color: importing ? 'var(--text3)' : 'var(--green)',
+                      fontSize: 12, cursor: importing ? 'default' : 'pointer',
+                      fontFamily: 'var(--mono)', transition: 'all .15s',
+                    }}>
+                    {importing ? 'Importing…' : `↑ Import ${importParsed.length} entries`}
+                  </button>
+                )}
+
+                {importResult && (
+                  <div style={{
+                    marginTop: 14, padding: '10px 14px', fontSize: 11,
+                    fontFamily: 'var(--mono)', borderRadius: 'var(--radius-md)',
+                    background: 'rgba(52,199,89,.08)', border: '1px solid rgba(52,199,89,.2)',
+                    lineHeight: 1.8,
+                  }}>
+                    <div style={{ color: 'var(--green)', fontWeight: 600, marginBottom: 4 }}>
+                      ✓ Import complete
+                    </div>
+                    <div style={{ color: 'var(--text2)' }}>
+                      {importResult.imported} new · {importResult.updated} updated · {importResult.skipped} skipped
+                    </div>
+                    {importResult.errors?.length > 0 && (
+                      <div style={{ marginTop: 8, color: 'var(--orange)' }}>
+                        {importResult.errors.slice(0, 5).map((e, i) => (
+                          <div key={i}>⚠ {e}</div>
+                        ))}
+                        {importResult.errors.length > 5 && (
+                          <div>…and {importResult.errors.length - 5} more warnings</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </>)}
+
+              {role !== 'admin' && (
+                <div style={{ fontSize: 12, color: 'var(--text3)', fontFamily: 'var(--mono)' }}>
+                  Import is restricted to admins.
+                </div>
+              )}
+            </div>
+          </div>
         )}
       </div>
 
