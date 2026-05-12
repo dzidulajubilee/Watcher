@@ -47,7 +47,7 @@ function TopTalkersChart({ data }) {
                           borderRadius:3, overflow:'hidden' }}>
               <div style={{
                 position:'absolute', inset:'0 auto 0 0', width:`${pct}%`,
-                background:'linear-gradient(90deg, var(--accent), var(--accent) 60%, rgba(79,156,249,.5))',
+                background:'linear-gradient(90deg, var(--accent), var(--accent) 60%, var(--accent-d))',
                 borderRadius:3, transition:'width .4s ease',
               }}/>
               <div style={{ position:'absolute', inset:0, display:'flex',
@@ -428,7 +428,7 @@ function ChartTypeMenu({ value, onChange }) {
                 style={{
                   display:'flex', alignItems:'center', gap:9, width:'100%',
                   padding:'8px 14px', border:'none', cursor:'pointer',
-                  background: value === type ? 'rgba(79,156,249,.12)' : 'transparent',
+                  background: value === type ? 'var(--accent-d)' : 'transparent',
                   color: value === type ? 'var(--accent)' : 'var(--text2)',
                   fontSize:12, fontFamily:'var(--mono)', textAlign:'left',
                   transition:'background .1s',

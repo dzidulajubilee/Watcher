@@ -95,7 +95,7 @@ export function ExplainDialog({ alert, role, aiEnabled: aiEnabledProp, onClose }
         }}>
           <div style={{
             width: 34, height: 34, borderRadius: 'var(--radius-md)', flexShrink: 0,
-            background: 'var(--accent-d)', border: '1px solid rgba(79,156,249,.25)',
+            background: 'var(--accent-d)', border: '1px solid var(--accent-b)',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
           }}>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
@@ -169,7 +169,7 @@ export function ExplainDialog({ alert, role, aiEnabled: aiEnabledProp, onClose }
             {!aiLoading && aiError && (
               <div>
                 <div style={{
-                  background: 'rgba(240,84,84,.08)', border: '1px solid rgba(240,84,84,.2)',
+                  background: 'var(--red-d)', border: '1px solid var(--red-b)',
                   borderRadius: 'var(--radius-md)', padding: '12px 14px',
                   color: 'var(--red)', fontSize: 12, lineHeight: 1.6, marginBottom: 12,
                 }}>
@@ -192,9 +192,9 @@ export function ExplainDialog({ alert, role, aiEnabled: aiEnabledProp, onClose }
                   <span style={{
                     fontSize: 9, fontFamily: 'var(--mono)', letterSpacing: '.08em',
                     textTransform: 'uppercase', padding: '2px 8px', borderRadius: 20,
-                    background: aiData.cached ? 'rgba(52,199,89,.1)' : 'rgba(79,156,249,.12)',
+                    background: aiData.cached ? 'var(--green-d)'   : 'var(--accent-d)',
                     color:      aiData.cached ? 'var(--green)'       : 'var(--accent)',
-                    border:     aiData.cached ? '1px solid rgba(52,199,89,.25)' : '1px solid rgba(79,156,249,.25)',
+                    border:     aiData.cached ? '1px solid var(--green-b)' : '1px solid var(--accent-b)',
                   }}>
                     {aiData.cached ? '✓ Saved' : '⚡ Generated'}
                   </span>
@@ -213,7 +213,7 @@ export function ExplainDialog({ alert, role, aiEnabled: aiEnabledProp, onClose }
                       <span style={{
                         fontSize:9, fontFamily:'var(--mono)', color:'var(--green)',
                         padding:'2px 6px', borderRadius:4,
-                        background:'rgba(52,199,89,.08)', border:'1px solid rgba(52,199,89,.2)',
+                        background:'var(--green-d)', border:'1px solid var(--green-b)',
                       }}>✓ Auto-saved</span>
                     )}
                     {(role === 'admin' || role === 'analyst') && (
@@ -644,7 +644,7 @@ export function ThreatIntelPanel({ role }) {
             <div style={{ marginBottom: 16, padding: '10px 14px', fontSize: 12,
                           color: 'var(--text2)', lineHeight: 1.7,
                           background: 'var(--accent-d)', borderRadius: 'var(--radius-md)',
-                          border: '1px solid rgba(79,156,249,.2)' }}>
+                          border: '1px solid var(--accent-b)' }}>
               <b style={{ color: 'var(--accent)' }}>Threat Intel</b> explanations appear
               in the <b style={{ color: 'var(--text1)' }}>Explain</b> dialog when analysts
               click an alert. SID-specific entries take priority over category entries.
@@ -685,7 +685,7 @@ export function ThreatIntelPanel({ role }) {
                     textTransform: 'uppercase', padding: '2px 7px', borderRadius: 20,
                     background: e.sig_id ? 'var(--accent-d)' : 'rgba(159,122,234,.15)',
                     color: e.sig_id ? 'var(--accent)' : 'var(--purple)',
-                    border: `1px solid ${e.sig_id ? 'rgba(79,156,249,.3)' : 'rgba(159,122,234,.3)'}`,
+                    border: `1px solid ${e.sig_id ? 'var(--accent-b)' : 'rgba(159,122,234,.3)'}`,
                   }}>{e.sig_id ? `SID ${e.sig_id}` : `Category`}</span>
                   <span style={{ fontWeight: 500, fontSize: 13, color: 'var(--text1)' }}>
                     {e.sig_msg || e.category || '—'}
@@ -825,7 +825,7 @@ export function ThreatIntelPanel({ role }) {
               {/* Format guide */}
               <div style={{
                 marginBottom: 14, padding: '12px 14px', fontSize: 11,
-                background: 'rgba(79,156,249,.06)', border: '1px solid rgba(79,156,249,.18)',
+                background: 'var(--accent-d)', border: '1px solid var(--accent-b)',
                 borderRadius: 'var(--radius-md)', lineHeight: 1.8,
               }}>
                 <div style={{ fontWeight: 600, color: 'var(--accent)', marginBottom: 6, fontSize: 12 }}>
@@ -907,7 +907,7 @@ export function ThreatIntelPanel({ role }) {
                   <div style={{
                     marginBottom: 12, padding: '8px 12px', fontSize: 11,
                     fontFamily: 'var(--mono)', color: 'var(--red)',
-                    background: 'rgba(240,84,84,.08)', border: '1px solid rgba(240,84,84,.2)',
+                    background: 'var(--red-d)', border: '1px solid var(--red-b)',
                     borderRadius: 'var(--radius-md)',
                   }}>{importError}</div>
                 )}
@@ -936,8 +936,8 @@ export function ThreatIntelPanel({ role }) {
                     style={{
                       display: 'flex', alignItems: 'center', gap: 7,
                       padding: '7px 16px', borderRadius: 'var(--radius-md)',
-                      background: importing ? 'var(--bg2)' : 'rgba(52,199,89,.12)',
-                      border: `1px solid ${importing ? 'var(--border)' : 'rgba(52,199,89,.3)'}`,
+                      background: importing ? 'var(--bg2)' : 'var(--green-d)',
+                      border: `1px solid ${importing ? 'var(--border)' : 'var(--green-b)'}`,
                       color: importing ? 'var(--text3)' : 'var(--green)',
                       fontSize: 12, cursor: importing ? 'default' : 'pointer',
                       fontFamily: 'var(--mono)', transition: 'all .15s',
@@ -950,7 +950,7 @@ export function ThreatIntelPanel({ role }) {
                   <div style={{
                     marginTop: 14, padding: '10px 14px', fontSize: 11,
                     fontFamily: 'var(--mono)', borderRadius: 'var(--radius-md)',
-                    background: 'rgba(52,199,89,.08)', border: '1px solid rgba(52,199,89,.2)',
+                    background: 'var(--green-d)', border: '1px solid var(--green-b)',
                     lineHeight: 1.8,
                   }}>
                     <div style={{ color: 'var(--green)', fontWeight: 600, marginBottom: 4 }}>

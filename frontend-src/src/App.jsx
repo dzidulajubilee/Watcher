@@ -14,6 +14,12 @@ export default function App() {
   const [selected,     setSelected]     = useState(null);
   const [paused,       setPaused]       = useState(false);
   const [search,       setSearch]       = useState('');
+  const [searchResults,setSearchResults]= useState([]);   // DB search result rows
+  const [searchTotal,  setSearchTotal]  = useState(0);    // total matches in DB
+  const [searchLoading,setSearchLoading]= useState(false);// debounce in-flight
+  const searchOffsetRef = useRef(0);                      // for search load-more
+  const debounceRef   = useRef(null);                     // debounce timer
+  const activeQueryRef= useRef('');                       // last committed DB query
   const [activeSev,    setActiveSev]    = useState(
     new Set(['critical', 'high', 'medium', 'low', 'info'])
   );
@@ -342,6 +348,52 @@ export default function App() {
     catch { alert('Failed to clear DNS events'); }
   };
 
+  // ── Full-database search ───────────────────────────────────────────────────
+  function execSearch(q, offset = 0, append = false) {
+    if (!q) { setSearchResults([]); setSearchTotal(0); searchOffsetRef.current = 0; return; }
+    if (!append) setSearchLoading(true);
+    fetch(`/alerts?q=${encodeURIComponent(q)}&limit=300&offset=${offset}`)
+      .then(r => r.json())
+      .then(data => {
+        const rows  = Array.isArray(data) ? data : (data.rows || []);
+        const total = data.total ?? rows.length;
+        const loaded = rows.map(r => ({ ...r, tsStr: fmtTime(r.ts) }));
+        if (append) {
+          setSearchResults(prev => [...prev, ...loaded]);
+        } else {
+          setSearchResults(loaded);
+        }
+        setSearchTotal(total);
+        searchOffsetRef.current = offset + loaded.length;
+      })
+      .catch(() => {})
+      .finally(() => { if (!append) setSearchLoading(false); });
+  }
+
+  function handleSearchChange(e) {
+    const val = e.target.value;
+    setSearch(val);
+    clearTimeout(debounceRef.current);
+    if (!val.trim()) {
+      activeQueryRef.current = '';
+      setSearchResults([]); setSearchTotal(0); searchOffsetRef.current = 0;
+      setSearchLoading(false);
+      return;
+    }
+    setSearchLoading(true);
+    debounceRef.current = setTimeout(() => {
+      activeQueryRef.current = val.trim();
+      execSearch(val.trim(), 0, false);
+    }, 400);
+  }
+
+  function clearSearch() {
+    clearTimeout(debounceRef.current);
+    activeQueryRef.current = '';
+    setSearch(''); setSearchResults([]); setSearchTotal(0);
+    searchOffsetRef.current = 0; setSearchLoading(false);
+  }
+
   // ── Derived state ──────────────────────────────────────────────────────────
   const counts = useMemo(() => {
     const c = { critical:0, high:0, medium:0, low:0, info:0 };
@@ -357,18 +409,15 @@ export default function App() {
     return Object.entries(cc).sort((a, b) => b[1] - a[1]).slice(0, 5);
   }, [alerts]);
 
-  const q = search.toLowerCase();
-  const filtered = useMemo(() =>
-    alerts.filter(a =>
-      activeSev.has(a.severity) && (
-        !q ||
-        a.sig_msg?.toLowerCase().includes(q) ||
-        a.src_ip?.includes(q) ||
-        a.dst_ip?.includes(q) ||
-        String(a.sig_id).includes(q) ||
-        a.category?.toLowerCase().includes(q)
-      )
-    ), [alerts, activeSev, q]);
+  const isDbSearch = search.trim().length > 0;
+  const filtered = useMemo(() => {
+    if (isDbSearch) {
+      // DB search mode: results already come filtered from server; apply sev filter only
+      return searchResults.filter(a => activeSev.has(a.severity));
+    }
+    // Normal mode: client-side filter of loaded rows
+    return alerts.filter(a => activeSev.has(a.severity));
+  }, [alerts, searchResults, activeSev, isDbSearch]);
 
   function toggleSev(s) {
     setActiveSev(prev => {
@@ -522,13 +571,13 @@ export default function App() {
               const isActive = search === ip;
               return (
                 <div key={ip}
-                     onClick={() => setSearch(isActive ? '' : ip)}
+                     onClick={() => { isActive ? clearSearch() : handleSearchChange({ target: { value: ip } }); }}
                      title={isActive ? 'Click to clear filter' : `Click to filter: ${ip}`}
                      style={{
                        marginBottom:8, cursor:'pointer', padding:'4px 6px', margin:'0 -6px 8px',
                        borderRadius:'var(--radius-sm)',
                        background: isActive ? 'var(--accent-d)' : 'transparent',
-                       border: isActive ? '1px solid rgba(79,156,249,.25)' : '1px solid transparent',
+                       border: isActive ? '1px solid var(--accent-b)' : '1px solid transparent',
                        transition:'background .12s, border-color .12s',
                      }}>
                   <div style={{ display:'flex', justifyContent:'space-between', fontSize:11, marginBottom:3 }}>
@@ -581,14 +630,26 @@ export default function App() {
           <div style={{ display:'flex', flexDirection:'column', overflow:'hidden', borderRight:'1px solid var(--border)' }}>
             <div className="pane-head">
               <span className="pane-title">Alert Stream</span>
-              <span className="pane-cnt">{filtered.length.toLocaleString()}</span>
-              {totalAlerts > 0 && (
-                <span style={{ fontSize:10, fontFamily:'var(--mono)',
-                               color: alerts.length < totalAlerts ? 'var(--yellow)' : 'var(--text3)',
-                               background:'var(--bg2)', border:'1px solid var(--border)',
-                               padding:'1px 7px', borderRadius:10,
-                               title:`${alerts.length} loaded of ${totalAlerts} total` }}>
-                  {alerts.length.toLocaleString()} / {totalAlerts.toLocaleString()}
+
+              {/* Left-side count / search-status badge */}
+              {!isDbSearch && (
+                <>
+                  <span className="pane-cnt">{filtered.length.toLocaleString()}</span>
+                  {totalAlerts > 0 && (
+                    <span className="pane-cnt" style={{
+                      color: alerts.length < totalAlerts ? 'var(--yellow)' : 'var(--text3)',
+                    }}>
+                      {alerts.length.toLocaleString()} / {totalAlerts.toLocaleString()}
+                    </span>
+                  )}
+                </>
+              )}
+              {isDbSearch && searchLoading && (
+                <span className="search-badge searching">Searching…</span>
+              )}
+              {isDbSearch && !searchLoading && (
+                <span className={`search-badge ${searchTotal > 0 ? 'found' : 'zero'}`}>
+                  {searchTotal.toLocaleString()} found in DB
                 </span>
               )}
               <div className="pane-actions">
@@ -596,11 +657,18 @@ export default function App() {
                   <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
                     <circle cx="7" cy="7" r="4"/><path d="M10 10l3 3"/>
                   </svg>
-                  <input placeholder="Search alerts…" value={search} onChange={e => setSearch(e.target.value)}/>
+                  <input
+                    placeholder="Search SID, IP or signature…"
+                    value={search}
+                    onChange={handleSearchChange}
+                  />
+                  {search && (
+                    <button className="search-clear" onClick={clearSearch} title="Clear search">✕</button>
+                  )}
                 </div>
                 {selected && (role === 'admin' || role === 'analyst') && (
                   <button className="btn" onClick={() => setShowExplain(true)}
-                          style={{ color: 'var(--accent)', borderColor: 'rgba(79,156,249,.35)' }}>
+                          style={{ color: 'var(--accent)', borderColor: 'var(--accent-b)' }}>
                     Explain
                   </button>
                 )}
@@ -620,7 +688,7 @@ export default function App() {
               {selectedIds.size > 0 && (role === 'admin' || role === 'analyst') && (
                 <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap',
                               padding:'7px 12px', background:'var(--accent-d)',
-                              borderBottom:'1px solid rgba(79,156,249,.2)', fontSize:12, flexShrink:0 }}>
+                              borderBottom:'1px solid var(--accent-b)', fontSize:12, flexShrink:0 }}>
                   <span style={{ fontFamily:'var(--mono)', color:'var(--accent)', fontWeight:500, whiteSpace:'nowrap' }}>
                     {selectedIds.size} selected
                   </span>
@@ -662,14 +730,24 @@ export default function App() {
               )}
 
               {filtered.length === 0 ? (
-                <div className="empty">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1">
-                    <rect x="3" y="3" width="18" height="18" rx="2"/>
-                    <line x1="3" y1="9" x2="21" y2="9"/>
-                    <line x1="9" y1="21" x2="9" y2="9"/>
-                  </svg>
-                  <div>{connState === 'live' ? 'No alerts match current filters' : 'Connecting…'}</div>
-                </div>
+                isDbSearch && searchLoading ? null :
+                isDbSearch ? (
+                  <div className="empty-inline">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" width="13" height="13">
+                      <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.35-4.35"/>
+                    </svg>
+                    No results found in database
+                  </div>
+                ) : (
+                  <div className="empty">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1">
+                      <rect x="3" y="3" width="18" height="18" rx="2"/>
+                      <line x1="3" y1="9" x2="21" y2="9"/>
+                      <line x1="9" y1="21" x2="9" y2="9"/>
+                    </svg>
+                    <div>{connState === 'live' ? 'No alerts match current filters' : 'Connecting…'}</div>
+                  </div>
+                )
               ) : (
                 <table>
                   <thead>
@@ -726,28 +804,52 @@ export default function App() {
               )}
 
               {/* ── Load More ── */}
-              {alerts.length < totalAlerts && (
-                <div style={{
-                  padding:'10px 0', textAlign:'center',
-                  borderTop:'1px solid var(--border)',
-                  background:'var(--bg1)',
-                }}>
-                  <button
-                    onClick={() => loadAlerts(offsetRef.current, true)}
-                    disabled={loadingMore}
-                    style={{
-                      background:'var(--bg2)', border:'1px solid var(--border2)',
-                      color:'var(--text2)', fontFamily:'var(--mono)', fontSize:11,
-                      padding:'5px 18px', borderRadius:'var(--radius-md)',
-                      cursor: loadingMore ? 'default' : 'pointer',
-                      opacity: loadingMore ? 0.6 : 1, transition:'opacity .15s',
-                    }}>
-                    {loadingMore
-                      ? 'Loading…'
-                      : `Load more  (${(totalAlerts - alerts.length).toLocaleString()} remaining)`}
-                  </button>
-                </div>
-              )}
+              {isDbSearch
+                ? searchResults.length < searchTotal && (
+                  <div style={{
+                    padding:'10px 0', textAlign:'center',
+                    borderTop:'1px solid var(--border)',
+                    background:'var(--bg1)',
+                  }}>
+                    <button
+                      onClick={() => execSearch(activeQueryRef.current, searchOffsetRef.current, true)}
+                      disabled={searchLoading}
+                      style={{
+                        background:'var(--bg2)', border:'1px solid var(--border2)',
+                        color:'var(--text2)', fontFamily:'var(--mono)', fontSize:11,
+                        padding:'5px 18px', borderRadius:'var(--radius-md)',
+                        cursor: searchLoading ? 'default' : 'pointer',
+                        opacity: searchLoading ? 0.6 : 1, transition:'opacity .15s',
+                      }}>
+                      {searchLoading
+                        ? 'Loading…'
+                        : `Load more  (${(searchTotal - searchResults.length).toLocaleString()} remaining)`}
+                    </button>
+                  </div>
+                )
+                : alerts.length < totalAlerts && (
+                  <div style={{
+                    padding:'10px 0', textAlign:'center',
+                    borderTop:'1px solid var(--border)',
+                    background:'var(--bg1)',
+                  }}>
+                    <button
+                      onClick={() => loadAlerts(offsetRef.current, true)}
+                      disabled={loadingMore}
+                      style={{
+                        background:'var(--bg2)', border:'1px solid var(--border2)',
+                        color:'var(--text2)', fontFamily:'var(--mono)', fontSize:11,
+                        padding:'5px 18px', borderRadius:'var(--radius-md)',
+                        cursor: loadingMore ? 'default' : 'pointer',
+                        opacity: loadingMore ? 0.6 : 1, transition:'opacity .15s',
+                      }}>
+                      {loadingMore
+                        ? 'Loading…'
+                        : `Load more  (${(totalAlerts - alerts.length).toLocaleString()} remaining)`}
+                    </button>
+                  </div>
+                )
+              }
             </div>
           </div>
 

@@ -55,7 +55,7 @@ export function SuppressionPanel({ role }) {
         <div style={{ marginBottom: 16, padding: '10px 14px', fontSize: 12,
                       color: 'var(--text2)', lineHeight: 1.7,
                       background: 'var(--red-d)', borderRadius: 'var(--radius-md)',
-                      border: '1px solid rgba(240,84,84,.2)' }}>
+                      border: '1px solid var(--red-b)' }}>
           <b style={{ color: 'var(--red)' }}>Suppression Rules</b> silence matching
           alerts before they are stored or streamed. Rules match on any combination
           of <b style={{ color: 'var(--text1)' }}>SID</b>,{' '}
@@ -116,7 +116,7 @@ export function SuppressionPanel({ role }) {
                     borderRadius: 20, letterSpacing: '.06em',
                     background: rule.enabled ? 'var(--red-d)' : 'var(--bg3)',
                     color: rule.enabled ? 'var(--red)' : 'var(--text3)',
-                    border: `1px solid ${rule.enabled ? 'rgba(240,84,84,.3)' : 'var(--border)'}`,
+                    border: `1px solid ${rule.enabled ? 'var(--red-b)' : 'var(--border)'}`,
                   }}>{rule.enabled ? 'ACTIVE' : 'DISABLED'}</span>
                 )}
                 <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6 }}>

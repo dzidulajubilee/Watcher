@@ -188,8 +188,8 @@ function WebhookForm({ initial, onSave, onCancel }) {
       <div style={{ marginBottom:14 }}>
         <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
                       padding:'10px 12px', borderRadius:'var(--radius-md)',
-                      background: form.allow_local_ips ? 'rgba(79,156,249,.06)' : 'var(--bg2)',
-                      border:`1px solid ${form.allow_local_ips ? 'rgba(79,156,249,.25)' : 'var(--border)'}`,
+                      background: form.allow_local_ips ? 'var(--accent-d)' : 'var(--bg2)',
+                      border:`1px solid ${form.allow_local_ips ? 'var(--accent-b)' : 'var(--border)'}`,
                       transition:'all .15s' }}>
           <div>
             <div style={{ fontSize:12, fontWeight:600, color:'var(--text1)', marginBottom:2 }}>
@@ -400,7 +400,7 @@ function WebhooksView({ webhooks, onRefresh, triggerNew }) {
   return (
     <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden' }}>
       <div style={{ flex:1, overflowY:'auto', padding:20 }}>
-        <div style={{ background:'var(--accent-d)', border:'1px solid rgba(79,156,249,.2)',
+        <div style={{ background:'var(--accent-d)', border:'1px solid var(--accent-b)',
                       borderRadius:'var(--radius-md)', padding:'10px 14px',
                       fontSize:12, color:'var(--text2)', marginBottom:20, lineHeight:1.7 }}>
           <b style={{ color:'var(--accent)' }}>Webhooks</b> send a POST request to your URL whenever
@@ -538,7 +538,7 @@ function DataControlPanel({ role }) {
           {replayDone && (
             <div style={{
               marginTop:12, padding:'8px 12px', borderRadius:'var(--radius-md)',
-              background:'rgba(52,199,89,.08)', border:'1px solid rgba(52,199,89,.2)',
+              background:'var(--green-d)', border:'1px solid var(--green-b)',
               fontSize:11, fontFamily:'var(--mono)', color:'var(--green)',
             }}>
               ✓ Done — {replayStatus.inserted?.toLocaleString()} inserted ·{' '}
@@ -549,7 +549,7 @@ function DataControlPanel({ role }) {
           {replayErr && (
             <div style={{
               marginTop:12, padding:'8px 12px', borderRadius:'var(--radius-md)',
-              background:'rgba(240,84,84,.08)', border:'1px solid rgba(240,84,84,.2)',
+              background:'var(--red-d)', border:'1px solid var(--red-b)',
               fontSize:11, fontFamily:'var(--mono)', color:'var(--red)',
             }}>
               ✗ {replayErr}
@@ -569,15 +569,15 @@ function DataControlPanel({ role }) {
           <button onClick={() => { setShowFlushDlg(true); setFlushResult(null); }}
             style={{
               fontSize:11, padding:'6px 16px', borderRadius:'var(--radius-md)',
-              background:'rgba(240,84,84,.12)', color:'var(--red)',
-              border:'1px solid rgba(240,84,84,.3)', cursor:'pointer', fontFamily:'var(--mono)',
+              background:'var(--red-d)', color:'var(--red)',
+              border:'1px solid var(--red-b)', cursor:'pointer', fontFamily:'var(--mono)',
             }}>
             🗑  Flush All Records
           </button>
           {flushResult && (
             <div style={{
               marginTop:12, padding:'8px 12px', borderRadius:'var(--radius-md)',
-              background:'rgba(52,199,89,.08)', border:'1px solid rgba(52,199,89,.2)',
+              background:'var(--green-d)', border:'1px solid var(--green-b)',
               fontSize:11, fontFamily:'var(--mono)', color:'var(--green)',
             }}>
               ✓ Flushed — alerts: {flushResult.alerts?.toLocaleString()} ·
@@ -764,9 +764,9 @@ function AiExplainPanel({ role }) {
                 <span style={{
                   fontSize: 9, fontFamily: 'var(--mono)', padding: '2px 7px',
                   borderRadius: 10, letterSpacing: '.06em', textTransform: 'uppercase',
-                  background: hasKey ? 'rgba(52,199,89,.1)' : 'rgba(240,84,84,.1)',
+                  background: hasKey ? 'var(--green-d)' : 'var(--red-d)',
                   color:      hasKey ? 'var(--green)'       : 'var(--red)',
-                  border:     hasKey ? '1px solid rgba(52,199,89,.25)' : '1px solid rgba(240,84,84,.25)',
+                  border:     hasKey ? '1px solid var(--green-b)' : '1px solid var(--red-b)',
                 }}>
                   {hasKey ? `Key set · ${pStatus.key_hint}` : 'No key'}
                 </span>
@@ -813,7 +813,7 @@ function AiExplainPanel({ role }) {
                   {hasKey && pStatus.key_source === 'db' && (
                     <button onClick={() => save({ api_key: '', target_provider: pid }).then(r => r && setMsg({ text: `Key cleared for ${pm.label}.`, ok: true }))}
                       style={{
-                        background: 'rgba(240,84,84,.1)', border: '1px solid rgba(240,84,84,.25)',
+                        background: 'var(--red-d)', border: '1px solid var(--red-b)',
                         color: 'var(--red)', borderRadius: 'var(--radius-md)', padding: '6px 10px',
                         fontSize: 11, cursor: 'pointer',
                       }}>
@@ -850,9 +850,9 @@ function AiExplainPanel({ role }) {
         <div style={{
           fontSize: 11, fontFamily: 'var(--mono)', padding: '8px 12px',
           borderRadius: 'var(--radius-md)',
-          background: msg.ok ? 'rgba(52,199,89,.08)' : 'rgba(240,84,84,.08)',
+          background: msg.ok ? 'var(--green-d)' : 'var(--red-d)',
           color:      msg.ok ? 'var(--green)'        : 'var(--red)',
-          border:     msg.ok ? '1px solid rgba(52,199,89,.2)' : '1px solid rgba(240,84,84,.2)',
+          border:     msg.ok ? '1px solid var(--green-b)' : '1px solid var(--red-b)',
         }}>{msg.text}</div>
       )}
     </div>
