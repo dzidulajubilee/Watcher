@@ -31,7 +31,7 @@ Reads `eve.json`, streams live alerts, and presents everything in a fast single-
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  Suricata (IDS engine)                                                      │
-│  /var/log/suricata/eve.json  ◄── continuous append                         │
+│  /var/log/suricata/eve.json  ◄── continuous append                          │
 └───────────────────────────────┬─────────────────────────────────────────────┘
                                 │ inotify-style readline loop
                                 ▼
@@ -39,22 +39,22 @@ Reads `eve.json`, streams live alerts, and presents everything in a fast single-
 │  tail.py  (tail_thread — daemon)                                          │
 │                                                                           │
 │  parse_eve_line()                                                         │
-│    ├── alert  → suppression check → DB insert → SSE broadcast → webhook  │
-│    ├── flow   → DB insert → SSE broadcast                                │
-│    ├── dns    → DNS DB insert → SSE broadcast                            │
-│    └── http   → DB insert → SSE broadcast                                │
+│    ├── alert  → suppression check → DB insert → SSE broadcast → webhook   │
+│    ├── flow   → DB insert → SSE broadcast                                 │
+│    ├── dns    → DNS DB insert → SSE broadcast                             │
+│    └── http   → DB insert → SSE broadcast                                 │
 │                                                                           │
-│  purge_thread (daemon)  — hourly retention sweep + WAL checkpoint        │
+│  purge_thread (daemon)  — hourly retention sweep + WAL checkpoint         │
 └────────┬───────────────────────┬──────────────────────────────────────────┘
          │                       │
          ▼                       ▼
 ┌─────────────────┐    ┌──────────────────────┐
-│  events.db      │    │  config.db            │
-│  ─────────────  │    │  ─────────────────    │
-│  alerts         │    │  users / sessions     │
-│  flows          │    │  webhooks             │
-│  http_events    │    │  threat_intel         │
-│  ack_history    │    │  suppression_rules    │
+│  events.db      │    │  config.db           │
+│  ─────────────  │    │  ─────────────────   │
+│  alerts         │    │  users / sessions    │
+│  flows          │    │  webhooks            │
+│  http_events    │    │  threat_intel        │
+│  ack_history    │    │  suppression_rules   │
 └─────────────────┘    └──────────────────────┘
          │
          ▼
