@@ -103,7 +103,7 @@ PYEOF
     # ── Install banner ────────────────────────────────────────────────────────
     echo ""
     echo "┌─────────────────────────────────────────────────────────┐"
-    echo "│  Watcher IDS v1.7.2 installed successfully              │"
+    echo "│  Watcher IDS v1.7.3 installed successfully              │"
     echo "│                                                         │"
     echo "│  Dashboard  →  http://localhost:8765/                   │"
     echo "│  Logs       →  journalctl -u watcher -f                 │"
@@ -121,7 +121,14 @@ PYEOF
     fi
 
     echo "│                                                         │"
-    echo "│  What's new in v1.7.2:                                  │"
+    echo "│  What's new in v1.7.3:                                  │"
+    echo "│    • Fix: replay no longer fires live webhooks          │"
+    echo "│    • Fix: alert ID collision under high traffic         │"
+    echo "│      (entropy suffix — no more silent drops)            │"
+    echo "│    • Perf: webhook config cached 30 s — no per-alert DB │"
+    echo "│    • Perf: webhook retries non-blocking, no stalls      │"
+    echo "│                                                         │"
+    echo "│  v1.7.2:                                                │"
     echo "│    • Fix: '0 found in DB' badge rendered as a huge     │"
     echo "│      200 px box (CSS class-name collision resolved)     │"
     echo "│    • All search-status badges now identical in size:    │"
