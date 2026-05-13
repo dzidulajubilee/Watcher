@@ -884,7 +884,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = replay_eve(
                     str(eve_path), db, registry,
-                    wdb=wdb, dns_db=dns_db, sup_db=sup_db,
+                    dns_db=dns_db, sup_db=sup_db,
                 )
                 # Invalidate stats cache so /health reflects new counts
                 with Handler._stats_lock:

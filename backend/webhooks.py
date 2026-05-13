@@ -42,6 +42,13 @@ _PRIVATE_NETWORKS = [
 
 _ALLOWED_SCHEMES = {"http", "https"}
 
+# ── Webhook list in-memory cache (P-01 fix) ───────────────────────────────────
+# dispatch() is called on every alert; caching avoids a DB round-trip each time.
+_wh_cache: list = []
+_wh_cache_ts: float = 0.0
+_wh_cache_lock = threading.Lock()
+_WH_CACHE_TTL = 30   # seconds — webhooks rarely change
+
 
 def validate_webhook_url(url: str, allow_local: bool = False) -> str | None:
     """
@@ -154,6 +161,26 @@ class WebhookDB:
         """).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def get_cached(self) -> list[dict]:
+        """
+        Return the webhook list from memory when possible (P-01).
+        Refreshes from DB if the cache is older than _WH_CACHE_TTL seconds.
+        All mutations call _invalidate_cache() so the next dispatch() sees
+        the updated list immediately.
+        """
+        global _wh_cache, _wh_cache_ts
+        with _wh_cache_lock:
+            if time.time() - _wh_cache_ts > _WH_CACHE_TTL:
+                _wh_cache    = self.get_all()
+                _wh_cache_ts = time.time()
+            return list(_wh_cache)   # shallow copy — callers must not mutate
+
+    def _invalidate_cache(self):
+        """Force the next get_cached() call to re-query the database."""
+        global _wh_cache_ts
+        with _wh_cache_lock:
+            _wh_cache_ts = 0.0
+
     def get(self, wid: int) -> dict | None:
         row = self._conn().execute(
             "SELECT id, name, type, url, enabled, severities, allow_local_ips, "
@@ -173,6 +200,7 @@ class WebhookDB:
         """, (name, wtype, url, 1 if enabled else 0,
               json.dumps(severities), 1 if allow_local_ips else 0, now))
         c.commit()
+        self._invalidate_cache()
         return self.get(cur.lastrowid)
 
     def update(self, wid: int, **fields) -> dict | None:
@@ -196,12 +224,14 @@ class WebhookDB:
         c = self._conn()
         c.execute(f"UPDATE webhooks SET {cols} WHERE id = ?", vals)
         c.commit()
+        self._invalidate_cache()
         return self.get(wid)
 
     def delete(self, wid: int):
         c = self._conn()
         c.execute("DELETE FROM webhooks WHERE id = ?", (wid,))
         c.commit()
+        self._invalidate_cache()
 
     def _mark_fired(self, wid: int, error: str | None = None):
         c = self._conn()
@@ -383,10 +413,11 @@ def deliver(url: str, payload: dict, allow_local: bool = False) -> str | None:
 _queue: Queue = Queue(maxsize=QUEUE_MAX)
 
 
-def enqueue(webhook: dict, alert: dict):
+def enqueue(webhook: dict, alert: dict,
+            retry_after: float = 0.0, attempt: int = 1):
     """Non-blocking enqueue. Drops silently if queue is full."""
     try:
-        _queue.put_nowait((webhook, alert))
+        _queue.put_nowait((webhook, alert, retry_after, attempt))
     except Exception:
         pass
 
@@ -394,33 +425,51 @@ def enqueue(webhook: dict, alert: dict):
 def delivery_worker(wdb: WebhookDB):
     """
     Runs forever in a daemon thread.
-    Drains the delivery queue, retrying failed deliveries.
+    Drains the delivery queue without blocking on retry back-off (P-04).
+
+    Failed deliveries are re-enqueued with a future retry_after timestamp
+    so the worker can continue processing other webhooks during the wait
+    window instead of sleeping and stalling all deliveries.
     """
     while True:
         try:
-            webhook, alert = _queue.get(timeout=5)
+            webhook, alert, retry_after, attempt = _queue.get(timeout=1)
         except Empty:
             continue
 
-        wid     = webhook["id"]
-        wtype   = webhook.get("type", "generic")
-        url     = webhook.get("url", "")
-        payload = build_payload(wtype, alert)
+        # Deferred item — not ready yet; put it back and yield briefly
+        now = time.time()
+        if retry_after > now:
+            try:
+                _queue.put_nowait((webhook, alert, retry_after, attempt))
+            except Exception:
+                pass   # queue full — drop this retry
+            time.sleep(0.1)
+            continue
 
+        wid         = webhook["id"]
+        wtype       = webhook.get("type", "generic")
+        url         = webhook.get("url", "")
+        payload     = build_payload(wtype, alert)
         allow_local = webhook.get("allow_local_ips", False)
-        error = None
-        for attempt in range(1, MAX_RETRIES + 1):
-            error = deliver(url, payload, allow_local=allow_local)
-            if error is None:
-                log.info("Webhook %d (%s) fired OK for alert %s",
-                         wid, webhook.get("name","?"), alert.get("sig_id","?"))
-                break
+
+        error = deliver(url, payload, allow_local=allow_local)
+        if error is None:
+            log.info("Webhook %d (%s) fired OK for alert %s",
+                     wid, webhook.get("name", "?"), alert.get("sig_id", "?"))
+            wdb._mark_fired(wid, None)
+        else:
             log.warning("Webhook %d attempt %d/%d failed: %s",
                         wid, attempt, MAX_RETRIES, error)
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY)
-
-        wdb._mark_fired(wid, error)
+                # Re-enqueue for a future attempt — does not block the worker
+                enqueue(webhook, alert,
+                        retry_after=time.time() + RETRY_DELAY,
+                        attempt=attempt + 1)
+            else:
+                log.error("Webhook %d giving up after %d attempts: %s",
+                          wid, MAX_RETRIES, error)
+                wdb._mark_fired(wid, error)
 
 
 # ── Main dispatcher ────────────────────────────────────────────────────────────
@@ -450,7 +499,7 @@ def dispatch(alert: dict, wdb: WebhookDB):
             for k in stale:
                 del _cooldown[k]
 
-    for wh in wdb.get_all():
+    for wh in wdb.get_cached():
         if not wh.get("enabled"):
             continue
         if sev not in wh.get("severities", ALL_SEVERITIES):

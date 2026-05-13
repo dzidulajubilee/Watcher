@@ -7,6 +7,7 @@ Background thread that tails eve.json and dispatches all event types:
 import json
 import logging
 import os
+import secrets
 import threading
 import time
 
@@ -66,7 +67,7 @@ def parse_eve_line(raw: str):
     if etype == "alert":
         a = evt.get("alert", {})
         return "alert", {
-            "id":       f"{evt.get('flow_id',0)}-{int(time.time()*1000)}",
+            "id":       f"{evt.get('flow_id',0)}-{int(time.time()*1000)}-{secrets.token_hex(4)}",
             "ts":       evt.get("timestamp", ""),
             "src_ip":   evt.get("src_ip", ""),
             "src_port": evt.get("src_port", 0),
@@ -235,13 +236,16 @@ def purge_thread(db, auth, dns_db=None):
         except Exception:
             pass
 
-def replay_eve(path: str, db, registry, wdb=None,
+def replay_eve(path: str, db, registry,
                dns_db=None, sup_db=None,
                progress_cb=None) -> dict:
     """
     Read eve.json from the beginning and insert every event into the DB.
     Existing records are skipped (upsert-on-conflict by ts+flow_id).
     Called by the admin Data Control panel — runs in a background thread.
+
+    Webhooks are intentionally NOT fired during replay; only live tail_thread
+    events should trigger external notifications.
 
     progress_cb: optional callable(inserted, skipped, total_lines) for status updates.
     Returns { inserted, skipped, errors, lines }.
@@ -262,8 +266,7 @@ def replay_eve(path: str, db, registry, wdb=None,
                         else:
                             db.insert(parsed)
                             registry.broadcast("alert", parsed)
-                            if wdb:
-                                _webhook_dispatch(parsed, wdb)
+                            # wdb intentionally omitted — replay must not fire live webhooks
                             inserted += 1
                     elif etype == "flow":
                         db.insert_flow(parsed); inserted += 1
