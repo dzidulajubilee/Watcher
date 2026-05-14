@@ -483,3 +483,66 @@ AGPL-3.0 — see [LICENSE](LICENSE).
 - Fix: webhook Test now respects Allow Local IPs setting
 - Fix: stale SSRF-blocked error cleared when Local IPs enabled
 - Fully air-gapped — zero external font/CDN dependencies
+
+### v1.6.0
+
+- Full-database alert search — queries entire retention window, not just loaded rows
+- Search across `sig_id` (index-backed), `src_ip`, `dst_ip`, `sig_msg`, `category`
+- `idx_a_dst_ip` index added for destination IP search performance
+- Admin Data Control panel: Replay (reimport `eve.json` without firing webhooks) and Flush (wipe all event data)
+- Replay is async — returns immediately, pollable via `GET /admin/replay`
+
+### v1.5.0
+
+- Dual-build system: single `./build-deb.sh` run produces full `.deb`, noai `.deb`, and source `.zip`
+- `strip-ai.py` — new tool that surgically removes the LLM engine from the source tree
+- AI-free variant keeps the Explain button, ExplainDialog, and Threat Intel tab fully functional
+- `build-deb.sh` rewritten: Step 1 builds frontend, Step 2 strips AI, Steps 3–5 package and archive
+
+### v1.4.0
+
+- NVIDIA NIM added as fourth AI provider (`deepseek-ai/deepseek-v4-pro` via `integrate.api.nvidia.com`)
+- Uses existing OpenAI-compatible `_call_openai_compat()` path — no new network code
+- `NVIDIA_API_KEY` env var support + Settings UI card
+- `watcher.conf` updated with NVIDIA key comment and link to `build.nvidia.com`
+
+### v1.3.1
+
+- Backend: 3 new SQLite PRAGMAs on `events.db` and `dns.db` (cache, mmap, temp_store)
+- Backend: 2 new indexes — `idx_a_sig_id` (GROUP BY), `idx_a_ack` (bulk-ack filter)
+- Backend: `fetch_recent()` strips `raw_json` by default; lazy `fetch_raw(id)` for Detail Raw tab
+- Backend: `registry.py` — `json.dumps()` moved outside lock; snapshot-then-iterate pattern
+- Backend: `dispatch` import moved to module level — no per-alert attribute lookup
+- Backend: `_stats_cache` — `stats()` result cached 5 s; avoids 7 DB queries per `/health` poll
+- Backend: `GET /alerts/<id>/raw` endpoint for single-alert raw JSON
+- Frontend: `alertIdsRef` Set replaces O(n) `prev.some()` scan — O(1) dedup per SSE event
+- Frontend: `aiEnabled` fetched once on mount and passed as prop
+- Frontend: Raw tab lazy-fetches JSON only on open
+- Packaging: `LICENSE` file bundled inside `.deb`; `AGPL-3.0-or-later` in `DEBIAN/control`
+
+### v1.3.0
+
+- Multi-provider AI: OpenAI (`gpt-4o-mini`) and Anthropic Claude Haiku added alongside DeepSeek
+- Global enable/disable toggle — when off, no API calls made and AI tab hidden
+- Per-provider key storage, masked hint display, and key-management links in Settings
+- `watcher.conf` updated with `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` comments
+
+### v1.2.1
+
+- Auto-explain: every new unique `sig_id` triggers a background thread that pre-fetches the summary
+- Prompt rewritten to strict 3-sentence executive summary; `MAX_TOKENS` reduced 700 → 220
+- `_explained_sids` set prevents duplicate API calls within a session
+- License changed from MIT to **AGPL-3.0-or-later**; all backend files updated with SPDX headers
+
+### v1.2.0
+
+- AI-powered alert explanations via DeepSeek — on-demand, cached by `sig_id`
+- `explain.py` — new `ExplainDB` (SQLite cache) + `ExplainEngine` (stdlib `urllib`)
+- `POST /alerts/explain`, `GET/PUT /settings/explain` API endpoints
+- ExplainDialog in UI: AI Explanation tab + Threat Intel tab; Cached/Fresh badge; Regenerate button
+- Settings → AI Explain tab: key status, save/clear, How It Works card
+
+### v1.1.0
+
+- Self-hosted fonts: Google Fonts CDN replaced with bundled `woff2` files (ibm-plex-mono/sans, inter, jetbrains-mono)
+- Install-time credential bootstrap: `postinst` seeds `config.db` with PBKDF2-SHA256 admin hash before service start; password printed in install banner
