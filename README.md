@@ -140,7 +140,7 @@ Browser ◄──► Python HTTP server  (handlers.py — ThreadedHTTPServer)
 ### Dual build
 
 ```
-./build-deb.sh 1.7.3
+./build-deb.sh 1.8.0
        │
        ├── Step 1: npm run build (frontend-src → frontend/)
        │
@@ -148,9 +148,9 @@ Browser ◄──► Python HTTP server  (handlers.py — ThreadedHTTPServer)
        │              removes: explain.py, LLM routes, AI settings panel
        │              keeps:   Explain button, Threat Intel tab, all data views
        │
-       ├── Step 3: watcher-ids_1.7.3_all.deb        (full — AI Explain included)
-       ├── Step 4: watcher-ids_1.7.3-noai_all.deb   (AI-free — smaller footprint)
-       └── Step 5: watcher-ids-src_1.7.3.zip        (source archive)
+       ├── Step 3: watcher-ids_1.8.0_all.deb        (full — AI Explain included)
+       ├── Step 4: watcher-ids_1.8.0-noai_all.deb   (AI-free — smaller footprint)
+       └── Step 5: watcher-ids-src_1.8.0.zip        (source archive)
 ```
 
 **No Node.js on the server.** The frontend is compiled once at build time and shipped as plain JS/CSS. The Python server serves static files only.
@@ -203,13 +203,15 @@ watcher-ids/
 ├── packaging/                .deb packaging support files
 │   ├── postinst              Runs after install: create user, systemd, seed admin
 │   ├── prerm                 Runs before remove: stop service
-│   ├── postrm                Runs after purge: clean up data directories
+│   ├── postrm                Runs after purge: clean up data dirs + Watcher-created nginx/systemd files
+│   ├── watcher-cli           /usr/bin/watcher admin command (--setup-https etc.)
 │   ├── watcher.service       systemd unit with security hardening
 │   └── watcher.conf          Default config file (/etc/watcher/watcher.conf)
 │
 ├── .github/workflows/
 │   └── build.yml             GitHub Actions: build both .deb variants on tag push
 │
+├── tests/                    Regression tests (stdlib unittest)
 ├── build-deb.sh              Dual-build script — produces full .deb, noai .deb, source .zip
 ├── strip-ai.py               Strips LLM engine from source tree to produce AI-free variant
 └── README.md
@@ -224,7 +226,7 @@ watcher-ids/
 Download the latest `.deb` from the [Releases](../../releases) page:
 
 ```bash
-sudo apt install ./watcher-ids_1.7.3_all.deb
+sudo apt install ./watcher-ids_1.8.0_all.deb
 ```
 
 That's it. The installer:
@@ -240,6 +242,8 @@ journalctl -u watcher | grep -A5 "First-run credentials"
 
 Open the dashboard: `http://your-server:8765/`
 
+To serve it over HTTPS instead (recommended on shared networks), run `sudo watcher --setup-https` — see [HTTPS](#https-nginx-front-end).
+
 ---
 
 ### Option B — Build the .deb yourself
@@ -249,17 +253,17 @@ Open the dashboard: `http://your-server:8765/`
 ```bash
 git clone https://github.com/yourname/watcher-ids.git
 cd watcher-ids
-./build-deb.sh 1.7.3
-sudo apt install ./packaging/build/watcher-ids_1.7.3_all.deb
+./build-deb.sh 1.8.0
+sudo apt install ./packaging/build/watcher-ids_1.8.0_all.deb
 ```
 
 The build script compiles the frontend with Vite, strips the AI engine for the noai variant, assembles both package trees, and calls `dpkg-deb`. Three artifacts are produced per run:
 
 | Artifact | Description |
 |---|---|
-| `watcher-ids_1.7.3_all.deb` | Full build — includes AI Explain (DeepSeek / OpenAI / Claude / NVIDIA) |
-| `watcher-ids_1.7.3-noai_all.deb` | AI-free build — LLM engine removed, Threat Intel and Explain button kept |
-| `watcher-ids-src_1.7.3.zip` | Source archive for distribution |
+| `watcher-ids_1.8.0_all.deb` | Full build — includes AI Explain (DeepSeek / OpenAI / Claude / NVIDIA) |
+| `watcher-ids_1.8.0-noai_all.deb` | AI-free build — LLM engine removed, Threat Intel and Explain button kept |
+| `watcher-ids-src_1.8.0.zip` | Source archive for distribution |
 
 ---
 
@@ -296,12 +300,50 @@ systemctl restart watcher
 |---|---|---|
 | `--eve` | `/var/log/suricata/eve.json` | Path to Suricata eve.json |
 | `--port` | `8765` | TCP port to listen on |
-| `--host` | `0.0.0.0` | Bind address |
+| `--host` | `0.0.0.0` | Bind address (default taken from the `WATCHER_HOST` environment variable if set — `watcher --setup-https` sets it to `127.0.0.1`) |
 | `--retain-days` | `90` | Days to keep events in SQLite |
 | `--db` | `/var/lib/watcher/events.db` | Events database path |
 | `--dns-db` | `/var/lib/watcher/dns.db` | DNS database path |
 | `--config-db` | `/var/lib/watcher/config.db` | Config database path |
-| `--password` | — | Set/change admin password, then exit |
+| `--password` | — | Set the emergency (break-glass) fallback password for the `admin` login, then exit |
+| `--clear-password` | — | Disable the emergency fallback password, then exit |
+
+### Emergency fallback password (break-glass)
+
+Normal logins use the accounts in **Settings → Users**. As a last resort, an operator with shell access can set a fallback password that logs in as `admin`:
+
+```bash
+sudo -u watcher python3 /opt/watcher/server.py --password '<new-password>'   # enable
+sudo -u watcher python3 /opt/watcher/server.py --clear-password              # disable
+sudo systemctl restart watcher
+```
+
+Since v1.8.0 no fallback password is generated automatically. Earlier versions created one on first start and printed it to the journal; on upgraded installs that old password **no longer works** (the stored hash is kept but ignored).
+
+---
+
+## HTTPS (nginx front end)
+
+```bash
+sudo watcher --setup-https          # enable
+watcher --https-status              # inspect
+sudo watcher --remove-https         # revert to plain HTTP on :8765
+```
+
+`--setup-https`:
+
+1. Installs `nginx` (and `openssl`) with `apt-get` **only if they are missing**. On an air-gapped host, install them from local packages first; if `apt-get` fails the command prints offline instructions and changes nothing.
+2. Checks for conflicts before changing anything — other nginx sites on the chosen ports (read from `nginx -T`, so includes are covered) or non-nginx programs on those ports. It never overwrites an nginx config it did not create.
+3. Creates a self-signed certificate in `/etc/watcher/tls/` (ECDSA P-256, 825 days, host name and IP addresses in the SAN). An existing certificate is kept; `--regen-cert` replaces it and backs up the old pair.
+4. Writes `/etc/nginx/conf.d/watcher.conf` (HTTPS on 443, HTTP→HTTPS redirect on 80, unbuffered live stream) and rolls back if `nginx -t` fails. If nginx was installed by this command, its stock welcome site is disabled so the redirect works; `--remove-https` re-enables it.
+5. Binds the backend to `127.0.0.1` with a systemd drop-in (`/etc/systemd/system/watcher.service.d/https.conf`), so port 8765 is no longer reachable from the network. `watcher.conf` is not edited — but an explicit `--host` in `WATCHER_ARGS` still wins, and the command warns about it.
+6. Restarts the services and verifies that the Watcher login page is served over HTTPS; prints the certificate's SHA-256 fingerprint so users can check it when their browser warns about the self-signed certificate.
+
+Options: `--hostname NAME`, `--https-port N` (e.g. `8443` if 443 is taken), `--http-port N` (`0` disables the redirect), `--regen-cert`.
+
+Behind the proxy, the backend trusts `X-Real-IP` / `X-Forwarded-Proto` **only from loopback**, so logs and the login rate limit see the real client address, and the session cookie is marked `Secure`.
+
+To use a certificate from your own CA instead, replace `/etc/watcher/tls/watcher.crt` and `watcher.key` and run `sudo systemctl reload nginx`.
 
 ---
 
@@ -319,6 +361,9 @@ systemctl restart watcher
 | Manage webhooks | ✓ | — | — |
 | Manage suppression rules | ✓ | — | — |
 | Manage users | ✓ | — | — |
+| Force-regenerate an AI explanation | ✓ | ✓ | — |
+
+Changing a user's role, disabling, renaming or deleting them ends their active sessions immediately. The webhook list (`GET /webhooks`) is admin-only because webhook URLs contain secret tokens.
 
 ---
 
@@ -343,7 +388,7 @@ The full build includes an auto-explain engine that generates an executive summa
 
 Supported providers: **DeepSeek**, **OpenAI**, **Claude (Anthropic)**, **NVIDIA NIM**.
 
-Configure at **Settings → AI Explain** or via `watcher.conf`. The noai build (`-noai` deb) has the LLM engine removed entirely — the Explain button and Threat Intel panel remain fully functional.
+Configure at **Settings → AI Explain** or via `watcher.conf` (`AI_PROVIDER` and the provider's API-key variable; the Settings UI takes priority). AI Explain is enabled by default but makes no API calls until a key is configured. Only the signature, SID, category, severity and protocol are sent to the provider — source/destination IP addresses are not. The noai build (`-noai` deb) has the LLM engine removed entirely — the Explain button and Threat Intel panel remain fully functional.
 
 ---
 
@@ -377,10 +422,12 @@ Test any webhook from the Settings panel without waiting for a real alert.
 ## Upgrading
 
 ```bash
-sudo apt install ./watcher-ids_1.7.3_all.deb
+sudo apt install ./watcher-ids_1.8.0_all.deb
 ```
 
-dpkg stops the running service, replaces files, restarts. Databases survive untouched. `/etc/watcher/watcher.conf` is preserved as a dpkg conffile.
+dpkg stops the running service, replaces files, restarts. Databases survive untouched. `/etc/watcher/watcher.conf` is preserved as a dpkg conffile. An HTTPS setup (`watcher --setup-https`) survives upgrades.
+
+**Upgrading to 1.8.0:** the first start adds one index to `events.db` (`idx_a_flow_ts`), which can take a little while on a large database. The old auto-generated fallback password stops working — see [Emergency fallback password](#emergency-fallback-password-break-glass).
 
 ---
 
@@ -390,6 +437,8 @@ dpkg stops the running service, replaces files, restarts. Databases survive unto
 sudo apt remove watcher-ids       # removes files, keeps databases and config
 sudo apt purge  watcher-ids       # removes everything including /var/lib/watcher
 ```
+
+`purge` also removes the nginx site and systemd drop-in created by `watcher --setup-https` (and the certificates in `/etc/watcher/tls`). nginx itself is not uninstalled.
 
 ---
 
@@ -415,13 +464,23 @@ cd frontend-src && npm run build
 
 ---
 
+## Tests
+
+Regression tests use only the Python standard library and run against temporary databases:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+---
+
 ## GitHub Actions
 
 Pushing a tag triggers an automatic build and GitHub Release:
 
 ```bash
-git tag v1.7.3
-git push origin v1.7.3
+git tag v1.8.0
+git push origin v1.8.0
 ```
 
 The workflow installs Node, builds the frontend, assembles both `.deb` variants (full + noai), and attaches them to the release. No secrets needed — only the default `GITHUB_TOKEN`.
@@ -448,6 +507,30 @@ AGPL-3.0 — see [LICENSE](LICENSE).
 ---
 
 ## Changelog
+
+### v1.8.0 — 2026-09-30
+
+#### New
+- **`watcher --setup-https`** — serves the dashboard over HTTPS via nginx with a self-signed certificate; binds the backend to `127.0.0.1`. `--remove-https` reverts it; `--https-status` inspects it. See [HTTPS](#https-nginx-front-end).
+- Regression test suite (`tests/`, standard library only).
+
+#### Security
+- The fallback password is no longer auto-generated and printed to the journal; it works only if set explicitly with `--password` (`--clear-password` disables it). Previously it acted as a permanent admin login that survived password changes and account disabling.
+- Sessions are revoked when a user is demoted, disabled, renamed or deleted (previously they kept their old privileges for up to 7 days).
+- `GET /webhooks` is admin-only (URLs contain secret tokens).
+- Webhook SSRF protection now blocks `0.0.0.0`, IPv4-mapped IPv6, IPv6 link-local, CGNAT and other non-global addresses, and re-validates every redirect.
+- Forcing an AI explanation to regenerate requires the admin or analyst role.
+
+#### Correctness
+- Live stream: a browser that fell behind during an alert burst (or a replay) stayed "connected" but stopped receiving alerts. The server now closes such streams so the browser reconnects.
+- Replay no longer duplicates alerts that are already stored (a regression from the v1.7.3 random ID suffix). Alert IDs keep their entropy suffix; replay checks flow ID, timestamp and signature instead.
+- Malformed `sig_id` / `expires_at` values return HTTP 400 instead of dropping the connection; a bad `sig_id` in a suppression-rule update no longer silently widens the rule.
+- Threat-intel imports record the importing user; a rejected user update no longer changes the password.
+
+#### Data & privacy
+- AI prompts no longer include source/destination IP addresses (they were sent to the provider and cached per signature).
+- Orphaned acknowledgement history is purged with the hourly maintenance.
+- `AI_PROVIDER` in `watcher.conf` is now honoured.
 
 ### v1.7.3 — 2026-05-13
 

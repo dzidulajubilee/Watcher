@@ -25,6 +25,7 @@ and saved (hashed) in config.db.  Change it any time:
 """
 
 import argparse
+import os
 import pathlib
 import logging
 import secrets
@@ -68,8 +69,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Path to Suricata eve.json")
     p.add_argument("--port",         default=config.DEFAULT_PORT, type=int,
                    help="TCP port to listen on")
-    p.add_argument("--host",         default=config.DEFAULT_HOST,
-                   help="Bind address")
+    p.add_argument("--host",
+                   default=os.environ.get("WATCHER_HOST", "").strip()
+                           or config.DEFAULT_HOST,
+                   help="Bind address (env WATCHER_HOST; set to 127.0.0.1 "
+                        "by 'watcher --setup-https' so only nginx can reach it)")
     p.add_argument("--db",           default=str(config.DEFAULT_DB),
                    help="Path to events SQLite database (alerts, flows, http)")
     p.add_argument("--dns-db",       default=str(config.DEFAULT_DNS_DB),
@@ -81,7 +85,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--retain-days",  default=config.RETAIN_DAYS, type=int,
                    help="Days to keep events in the database")
     p.add_argument("--password",     default=None,
-                   help="Set or change the dashboard password, then exit")
+                   help="Set the emergency fallback password for the 'admin' "
+                        "login (break-glass), then exit")
+    p.add_argument("--clear-password", action="store_true",
+                   dest="clear_password",
+                   help="Disable the emergency fallback password, then exit")
     return p
 
 
@@ -100,21 +108,23 @@ def main():
     # ── Auth (uses config DB) ─────────────────────────────────────────────────
     auth = AuthManager(conn_fn=cfg_db._conn)
 
-    # Password management mode: set password and exit
+    # Password management mode: set/clear fallback password and exit
     if args.password:
         auth.set_password(args.password)
-        log.info("Password updated. Restart the server without --password.")
+        log.info("Fallback password set. Restart the server without --password.")
+        return
+    if args.clear_password:
+        auth.clear_password()
         return
 
-    # First-run: auto-generate a password if none exists
-    if not auth.get_hash():
-        pw = secrets.token_urlsafe(14)
-        auth.set_password(pw)
-        log.info("=" * 58)
-        log.info("  No password set — generated a random one:")
-        log.info("  PASSWORD: %s", pw)
-        log.info("  Change:   python3 server.py --password <new>")
-        log.info("=" * 58)
+    # Security (v1.8.0): no fallback password is auto-generated any more.
+    # Previously one was created on first start and printed to the journal,
+    # where it acted as a permanent admin login that survived password
+    # changes and account disabling.  Accounts live in the users table;
+    # the fallback exists only if an operator sets it with --password.
+    if auth.fallback_enabled():
+        log.warning("Emergency fallback password is ENABLED "
+                    "(disable with: server.py --clear-password).")
 
     # ── Registry ──────────────────────────────────────────────────────────────
     registry = Registry()

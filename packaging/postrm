@@ -2,6 +2,25 @@
 set -e
 case "$1" in
   purge)
+    # ── HTTPS front end (watcher --setup-https) — only what Watcher created ──
+    MARKER="# Managed by Watcher IDS (watcher --setup-https)"
+    if [ -f /etc/nginx/conf.d/watcher.conf ] && \
+       grep -qF "$MARKER" /etc/nginx/conf.d/watcher.conf; then
+      rm -f /etc/nginx/conf.d/watcher.conf
+      if [ -f /etc/watcher/https.state ] && \
+         grep -q '^DEFAULT_SITE_DISABLED=1' /etc/watcher/https.state && \
+         [ -e /etc/nginx/sites-available/default ] && \
+         [ ! -e /etc/nginx/sites-enabled/default ]; then
+        ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+        nginx -t >/dev/null 2>&1 || rm -f /etc/nginx/sites-enabled/default
+      fi
+      if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx 2>/dev/null || true
+      fi
+    fi
+    rm -f /etc/systemd/system/watcher.service.d/https.conf
+    rmdir /etc/systemd/system/watcher.service.d 2>/dev/null || true
+
     rm -rf /var/lib/watcher /etc/watcher
     deluser  --system watcher  2>/dev/null || true
     delgroup --system watcher  2>/dev/null || true

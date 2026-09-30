@@ -1,0 +1,562 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# watcher — Watcher IDS administration helper (installed as /usr/bin/watcher)
+#
+#   sudo watcher --setup-https     Put the dashboard behind nginx (HTTPS,
+#                                  self-signed certificate). Backend is bound
+#                                  to 127.0.0.1 so plain HTTP is no longer
+#                                  reachable from the network.
+#   sudo watcher --remove-https    Undo everything --setup-https did
+#                                  (certificates are kept).
+#   watcher --https-status         Show the current HTTPS configuration.
+#
+# Design rules (see README → HTTPS):
+#   • Checks for conflicts BEFORE changing anything.
+#   • Never overwrites an nginx config it did not create.
+#   • Never deletes certificates; --regen-cert backs up the old pair.
+#   • Rolls back its nginx changes if `nginx -t` fails.
+#   • Does not edit /etc/watcher/watcher.conf (a dpkg conffile); the backend
+#     bind address is set with a removable systemd drop-in instead.
+#   • The only network access is `apt-get install nginx` when nginx is not
+#     already installed (skipped entirely on air-gapped hosts that pre-install
+#     it — see the message printed if apt-get fails).
+
+set -euo pipefail
+
+CONF=/etc/watcher/watcher.conf
+TLS_DIR=/etc/watcher/tls
+CRT="$TLS_DIR/watcher.crt"
+KEY="$TLS_DIR/watcher.key"
+NGINX_CONF=/etc/nginx/conf.d/watcher.conf
+NGINX_DEFAULT_ENABLED=/etc/nginx/sites-enabled/default
+NGINX_DEFAULT_AVAILABLE=/etc/nginx/sites-available/default
+DROPIN_DIR=/etc/systemd/system/watcher.service.d
+DROPIN="$DROPIN_DIR/https.conf"
+STATE=/etc/watcher/https.state
+MARKER="# Managed by Watcher IDS (watcher --setup-https). Remove with: watcher --remove-https"
+SERVER_PY=/opt/watcher/server.py
+
+# ── Output helpers ───────────────────────────────────────────────────────────
+say()  { printf '%s\n' "$*"; }
+step() { printf '\n▶  %s\n' "$*"; }
+ok()   { printf '   ✓ %s\n' "$*"; }
+warn() { printf '   ⚠ %s\n' "$*" >&2; }
+die()  { printf '\nwatcher: error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage: watcher COMMAND [OPTIONS]
+
+Commands:
+  --setup-https        Serve the dashboard over HTTPS via nginx with a
+                       self-signed certificate (requires root).
+  --remove-https       Revert --setup-https: remove the nginx site and the
+                       loopback bind; the dashboard is served on plain HTTP
+                       port 8765 again (requires root). Certificates are kept.
+  --https-status       Show HTTPS configuration, certificate and bind status.
+  -h, --help           Show this help.
+
+Options for --setup-https:
+  --hostname NAME      Name for the certificate (default: this host's FQDN).
+  --https-port N       HTTPS port nginx listens on (default: 443).
+  --http-port N        Port for the HTTP→HTTPS redirect (default: 80;
+                       0 disables the redirect).
+  --regen-cert         Generate a new certificate even if one exists
+                       (the old pair is backed up, not deleted).
+
+The Watcher service itself is still run by systemd (watcher.service);
+this command only manages the HTTPS front end.
+EOF
+}
+
+need_root() { [ "$(id -u)" -eq 0 ] || die "this command must be run as root (try: sudo watcher $CMD)"; }
+
+valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 0 ] && [ "$1" -le 65535 ]; }
+
+# Backend port: honour --port in WATCHER_ARGS (watcher.conf), default 8765.
+backend_port() {
+  local args="" p=""
+  if [ -r "$CONF" ]; then
+    args="$(grep -E '^[[:space:]]*WATCHER_ARGS=' "$CONF" | tail -n1 | cut -d= -f2- || true)"
+  fi
+  p="$(printf '%s' "$args" | grep -oE -- '--port([[:space:]]+|=)[0-9]+' | grep -oE '[0-9]+$' || true)"
+  printf '%s' "${p:-8765}"
+}
+
+conf_sets_host() {
+  [ -r "$CONF" ] && grep -E '^[[:space:]]*WATCHER_ARGS=' "$CONF" | tail -n1 | grep -qE -- '--host'
+}
+
+# Other nginx configs (not ours) that listen on port $1.
+# Primary method: parse `nginx -T` (the fully-resolved configuration, including
+# every include, single-line server blocks, and files outside conf.d).
+# Fallback (nginx -T unavailable/failing): scan enabled site files for any
+# `listen` directive, anywhere on the line.
+nginx_port_users() {
+  local port="$1" dump=""
+  if command -v nginx >/dev/null 2>&1 && dump="$(nginx -T 2>/dev/null)"; then
+    # The parser is passed with -c so that stdin carries ONLY the nginx dump
+    # (a heredoc on the same command would replace the piped data).
+    local parser
+    parser="$(cat <<'PYEOF'
+import re, sys
+port, ours = sys.argv[1], sys.argv[2]
+cur, hits = None, []
+for line in sys.stdin:
+    m = re.match(r"# configuration file (.+):\s*$", line)
+    if m:
+        cur = m.group(1); continue
+    if cur is None or cur == ours:
+        continue
+    code = line.split("#", 1)[0]
+    for lm in re.finditer(r"(?:^|[\s;{])listen\s+([^\s;]+)", code):
+        addr = lm.group(1)
+        if addr.startswith("unix:"):
+            continue
+        if "]:" in addr:   p = addr.rsplit("]:", 1)[1]
+        elif addr.startswith("["): p = "80"
+        elif ":" in addr:  p = addr.rsplit(":", 1)[1]
+        elif addr.isdigit(): p = addr
+        else:              p = "80"          # bare host name → default port
+        if p == port and cur not in hits:
+            hits.append(cur)
+print("\n".join(hits))
+PYEOF
+)"
+    printf '%s\n' "$dump" | python3 -c "$parser" "$port" \
+      "$(readlink -f "$NGINX_CONF" 2>/dev/null || echo "$NGINX_CONF")"
+    return 0
+  fi
+  local f
+  for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+    [ -e "$f" ] || continue
+    [ "$(readlink -f "$f")" = "$(readlink -f "$NGINX_CONF" 2>/dev/null || echo none)" ] && continue
+    # strip comments first — stock configs contain e.g. "# listen 443 ssl"
+    if sed 's/#.*//' "$f" | grep -qE "(^|[[:space:];{])listen[[:space:]]+([^;[:space:]]*:)?${port}([[:space:];]|$)"; then
+      printf '%s\n' "$f"
+    fi
+  done
+}
+
+# Is a NON-nginx process listening on TCP port $1?
+foreign_listener() {
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -ltnpH "sport = :$1" 2>/dev/null | grep -v '"nginx"' | grep -q . 
+}
+
+state_get() { [ -r "$STATE" ] && grep -E "^$1=" "$STATE" | tail -n1 | cut -d= -f2- || true; }
+
+have_systemd() { command -v systemctl >/dev/null 2>&1; }
+
+# ════════════════════════════════════════════════════════════════════════════
+# --setup-https
+# ════════════════════════════════════════════════════════════════════════════
+setup_https() {
+  local HOSTNAME_OPT="" HTTPS_PORT=443 HTTP_PORT=80 REGEN=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --hostname)   HOSTNAME_OPT="${2:-}"; shift 2 ;;
+      --hostname=*) HOSTNAME_OPT="${1#*=}"; shift ;;
+      --https-port) HTTPS_PORT="${2:-}"; shift 2 ;;
+      --https-port=*) HTTPS_PORT="${1#*=}"; shift ;;
+      --http-port)  HTTP_PORT="${2:-}"; shift 2 ;;
+      --http-port=*) HTTP_PORT="${1#*=}"; shift ;;
+      --regen-cert) REGEN=1; shift ;;
+      *) usage >&2; die "unknown option for --setup-https: $1" ;;
+    esac
+  done
+  need_root
+  valid_port "$HTTPS_PORT" && [ "$HTTPS_PORT" -ne 0 ] || die "invalid --https-port: $HTTPS_PORT"
+  valid_port "$HTTP_PORT" || die "invalid --http-port: $HTTP_PORT"
+  [ "$HTTP_PORT" != "$HTTPS_PORT" ] || die "--http-port and --https-port must differ"
+  [ -f "$SERVER_PY" ] || die "Watcher IDS does not appear to be installed ($SERVER_PY missing)"
+  have_systemd || die "systemd (systemctl) is required"
+
+  local CERT_HOST="${HOSTNAME_OPT:-$(hostname -f 2>/dev/null || hostname)}"
+  [[ "$CERT_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || die "invalid hostname for certificate: $CERT_HOST"
+  local BPORT; BPORT="$(backend_port)"
+
+  say "Watcher IDS — HTTPS setup"
+  say "   hostname: $CERT_HOST   https port: $HTTPS_PORT   redirect: $([ "$HTTP_PORT" -eq 0 ] && echo off || echo "port $HTTP_PORT")   backend: 127.0.0.1:$BPORT"
+
+  # ── 1. nginx + openssl (the only step that may need the network) ─────────
+  step "Checking nginx and openssl"
+  local NGINX_INSTALLED_NOW=0 PKGS=()
+  command -v nginx   >/dev/null 2>&1 || PKGS+=(nginx)
+  command -v openssl >/dev/null 2>&1 || PKGS+=(openssl)
+  if [ ${#PKGS[@]} -gt 0 ]; then
+    say "   Installing: ${PKGS[*]}"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${PKGS[@]}" >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get update -q >/dev/null 2>&1 || true
+      if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${PKGS[@]}"; then
+        cat >&2 <<EOF
+
+watcher: error: could not install ${PKGS[*]} with apt-get.
+
+On an air-gapped host, copy the packages from a machine with the same
+OS release and install them locally, then re-run this command:
+    apt-get download ${PKGS[*]} \$(apt-cache depends --recurse --no-recommends \\
+        --no-suggests --no-conflicts --no-breaks --no-replaces --no-enhances \\
+        ${PKGS[*]} | grep '^\w' | sort -u)      # on the connected machine
+    sudo apt-get install ./*.deb                  # on this host
+Nothing has been changed on this system.
+EOF
+        exit 1
+      fi
+    fi
+    [[ " ${PKGS[*]} " == *" nginx "* ]] && NGINX_INSTALLED_NOW=1
+    ok "Installed ${PKGS[*]}"
+  else
+    ok "nginx and openssl already installed"
+  fi
+
+  # ── 2. Pre-flight conflict checks (nothing modified yet) ─────────────────
+  step "Checking for conflicts"
+  if [ -e "$NGINX_CONF" ] && ! grep -qF "$MARKER" "$NGINX_CONF"; then
+    die "$NGINX_CONF exists and was not created by Watcher — refusing to overwrite it."
+  fi
+  local users
+  users="$(nginx_port_users "$HTTPS_PORT")"
+  if [ -n "$users" ]; then
+    die "other nginx site(s) already listen on port $HTTPS_PORT:
+$users
+Re-run with a free port, e.g.:  sudo watcher --setup-https --https-port 8443"
+  fi
+  if foreign_listener "$HTTPS_PORT"; then
+    die "another (non-nginx) program is listening on port $HTTPS_PORT. Choose another with --https-port."
+  fi
+
+  # Port-80 redirect: may need to step around the stock Debian welcome site.
+  local DISABLE_DEFAULT=0
+  if [ "$HTTP_PORT" -ne 0 ]; then
+    users="$(nginx_port_users "$HTTP_PORT")"
+    if [ -n "$users" ]; then
+      if { [ "$users" = "$NGINX_DEFAULT_ENABLED" ] || [ "$users" = "$NGINX_DEFAULT_AVAILABLE" ]; } &&
+         [ -L "$NGINX_DEFAULT_ENABLED" ] &&
+         { [ "$NGINX_INSTALLED_NOW" -eq 1 ] || [ "$(state_get DEFAULT_SITE_DISABLED)" = 1 ]; }; then
+        DISABLE_DEFAULT=1      # nginx's own welcome page, installed by us
+      else
+        warn "port $HTTP_PORT is already used by: $(echo $users) — HTTP→HTTPS redirect skipped."
+        HTTP_PORT=0
+      fi
+    elif foreign_listener "$HTTP_PORT"; then
+      warn "another program is listening on port $HTTP_PORT — HTTP→HTTPS redirect skipped."
+      HTTP_PORT=0
+    fi
+  fi
+  ok "No blocking conflicts"
+
+  # ── 3. Certificate ───────────────────────────────────────────────────────
+  step "Certificate"
+  install -d -m 700 -o root -g root "$TLS_DIR"
+  if [ -s "$CRT" ] && [ -s "$KEY" ] && [ "$REGEN" -eq 0 ]; then
+    ok "Keeping existing certificate ($CRT) — use --regen-cert to replace it"
+  else
+    if [ -e "$CRT" ] || [ -e "$KEY" ]; then
+      local ts; ts="$(date +%Y%m%d-%H%M%S)"
+      [ -e "$CRT" ] && mv "$CRT" "$CRT.bak-$ts"
+      [ -e "$KEY" ] && mv "$KEY" "$KEY.bak-$ts"
+      ok "Previous certificate backed up with suffix .bak-$ts"
+    fi
+    local SAN="DNS:$CERT_HOST,DNS:localhost,IP:127.0.0.1" ip
+    [ "$CERT_HOST" != "$(hostname -s 2>/dev/null || echo "$CERT_HOST")" ] && SAN="$SAN,DNS:$(hostname -s)"
+    for ip in $(hostname -I 2>/dev/null || true); do
+      [[ "$ip" == fe80:* ]] && continue
+      SAN="$SAN,IP:$ip"
+    done
+    ( umask 077
+      openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout "$KEY" -out "$CRT" -days 825 \
+        -subj "/CN=$CERT_HOST/O=Watcher IDS" \
+        -addext "subjectAltName=$SAN" \
+        -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1
+    ) || die "openssl failed to create the certificate"
+    chmod 600 "$KEY"; chmod 644 "$CRT"; chown root:root "$KEY" "$CRT"
+    ok "Self-signed certificate created (valid 825 days)"
+    say "     SAN: $SAN"
+  fi
+
+  # ── 4. nginx site (atomic write, rollback on failure) ─────────────────────
+  step "Configuring nginx"
+  local IPV6=0
+  [ -s /proc/net/if_inet6 ] && IPV6=1
+  local REDIRECT_TARGET='https://$host$request_uri'
+  [ "$HTTPS_PORT" -ne 443 ] && REDIRECT_TARGET="https://\$host:${HTTPS_PORT}\$request_uri"
+
+  local PREV_BACKUP=""
+  if [ -e "$NGINX_CONF" ]; then
+    PREV_BACKUP="$(mktemp)"; cp -p "$NGINX_CONF" "$PREV_BACKUP"
+  fi
+  local TMP; TMP="$(mktemp /etc/nginx/conf.d/.watcher.XXXXXX)"
+  {
+    echo "$MARKER"
+    echo "# Generated $(date -u +%Y-%m-%dT%H:%M:%SZ). Local edits are overwritten by re-running setup."
+    echo
+    echo "upstream watcher_backend {"
+    echo "    server 127.0.0.1:${BPORT};"
+    echo "    keepalive 16;"
+    echo "}"
+    echo
+    echo "server {"
+    echo "    listen ${HTTPS_PORT} ssl;"
+    [ "$IPV6" -eq 1 ] && echo "    listen [::]:${HTTPS_PORT} ssl;"
+    echo "    server_name _;"
+    echo "    server_tokens off;"
+    echo
+    echo "    ssl_certificate     ${CRT};"
+    echo "    ssl_certificate_key ${KEY};"
+    echo "    ssl_protocols       TLSv1.2 TLSv1.3;"
+    echo "    ssl_prefer_server_ciphers off;"
+    echo "    ssl_session_cache   shared:watcher_ssl:10m;"
+    echo "    ssl_session_timeout 1d;"
+    echo
+    echo "    # Backend caps request bodies at 1 MB (threat-intel import)."
+    echo "    client_max_body_size 2m;"
+    echo
+    echo "    proxy_http_version 1.1;"
+    echo "    proxy_set_header Connection \"\";"
+    echo "    proxy_set_header Host              \$host;"
+    echo "    proxy_set_header X-Real-IP         \$remote_addr;"
+    echo "    proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;"
+    echo "    proxy_set_header X-Forwarded-Proto \$scheme;"
+    echo
+    echo "    # Live alert stream (Server-Sent Events): no buffering, long-lived."
+    echo "    location = /events {"
+    echo "        proxy_pass http://watcher_backend;"
+    echo "        proxy_buffering off;"
+    echo "        proxy_cache off;"
+    echo "        proxy_read_timeout 1h;"
+    echo "    }"
+    echo
+    echo "    location / {"
+    echo "        proxy_pass http://watcher_backend;"
+    echo "        proxy_read_timeout 120s;   # admin replay/flush can be slow"
+    echo "    }"
+    echo "}"
+    if [ "$HTTP_PORT" -ne 0 ]; then
+      echo
+      echo "server {"
+      echo "    listen ${HTTP_PORT};"
+      [ "$IPV6" -eq 1 ] && echo "    listen [::]:${HTTP_PORT};"
+      echo "    server_name _;"
+      echo "    server_tokens off;"
+      echo "    return 301 ${REDIRECT_TARGET};"
+      echo "}"
+    fi
+  } > "$TMP"
+  chmod 644 "$TMP"
+  mv -f "$TMP" "$NGINX_CONF"
+
+  local DEFAULT_DISABLED_NOW=0
+  if [ "$DISABLE_DEFAULT" -eq 1 ] && [ -L "$NGINX_DEFAULT_ENABLED" ]; then
+    rm -f "$NGINX_DEFAULT_ENABLED"; DEFAULT_DISABLED_NOW=1
+  fi
+
+  if ! nginx -t >/dev/null 2>&1; then
+    nginx -t || true
+    # Roll back exactly what we changed
+    if [ -n "$PREV_BACKUP" ]; then mv -f "$PREV_BACKUP" "$NGINX_CONF"; else rm -f "$NGINX_CONF"; fi
+    [ "$DEFAULT_DISABLED_NOW" -eq 1 ] && ln -s "$NGINX_DEFAULT_AVAILABLE" "$NGINX_DEFAULT_ENABLED"
+    die "nginx rejected the configuration (shown above). All nginx changes were rolled back."
+  fi
+  [ -n "$PREV_BACKUP" ] && rm -f "$PREV_BACKUP"
+  ok "nginx site written: $NGINX_CONF (config test passed)"
+  [ "$DEFAULT_DISABLED_NOW" -eq 1 ] && ok "Disabled nginx's stock welcome site (restored by --remove-https)"
+
+  # ── 5. State (merge with any previous run) ───────────────────────────────
+  local PREV_INSTALLED PREV_DEFAULT
+  PREV_INSTALLED="$(state_get NGINX_INSTALLED_BY_WATCHER)"
+  PREV_DEFAULT="$(state_get DEFAULT_SITE_DISABLED)"
+  ( umask 077
+    cat > "$STATE" <<EOF
+# Written by watcher --setup-https — used by watcher --remove-https.
+NGINX_INSTALLED_BY_WATCHER=$([ "$NGINX_INSTALLED_NOW" -eq 1 ] || [ "$PREV_INSTALLED" = 1 ] && echo 1 || echo 0)
+DEFAULT_SITE_DISABLED=$([ "$DEFAULT_DISABLED_NOW" -eq 1 ] || [ "$PREV_DEFAULT" = 1 ] && echo 1 || echo 0)
+HTTPS_PORT=$HTTPS_PORT
+HTTP_PORT=$HTTP_PORT
+CERT_HOST=$CERT_HOST
+EOF
+  )
+
+  # ── 6. Bind the backend to loopback (systemd drop-in) ────────────────────
+  step "Restricting the backend to 127.0.0.1"
+  install -d -m 755 "$DROPIN_DIR"
+  cat > "$DROPIN" <<'EOF'
+# Written by `watcher --setup-https`; removed by `watcher --remove-https`.
+# Only local nginx may reach the backend; browsers use HTTPS via nginx.
+# (An explicit --host in WATCHER_ARGS in /etc/watcher/watcher.conf wins.)
+[Service]
+Environment=WATCHER_HOST=127.0.0.1
+EOF
+  chmod 644 "$DROPIN"
+  ok "Drop-in written: $DROPIN"
+  if conf_sets_host; then
+    warn "WATCHER_ARGS in $CONF sets --host, which overrides the loopback bind."
+    warn "Remove --host from WATCHER_ARGS so port $BPORT is not exposed over plain HTTP."
+  fi
+
+  # ── 7. Apply ─────────────────────────────────────────────────────────────
+  step "Applying"
+  systemctl daemon-reload
+  systemctl enable nginx >/dev/null 2>&1 || true
+  if systemctl is-active --quiet nginx; then systemctl reload nginx; else systemctl start nginx; fi
+  ok "nginx running"
+  systemctl restart watcher
+  ok "watcher restarted"
+
+  # ── 8. Verify ────────────────────────────────────────────────────────────
+  step "Verifying"
+  local VERIFIED=0 i
+  for i in $(seq 1 20); do
+    if python3 - "$HTTPS_PORT" <<'PYEOF' >/dev/null 2>&1
+import ssl, sys, urllib.request
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+with urllib.request.urlopen(f"https://127.0.0.1:{sys.argv[1]}/login", context=ctx, timeout=3) as r:
+    body = r.read(65536)
+    # Must be Watcher's own login page, not just any 200 from another site.
+    sys.exit(0 if r.status == 200 and b"/frontend/login.js" in body else 1)
+PYEOF
+    then VERIFIED=1; break; fi
+    sleep 1
+  done
+  if [ "$VERIFIED" -eq 1 ]; then
+    ok "Login page served over HTTPS on port $HTTPS_PORT"
+  else
+    warn "Could not load https://127.0.0.1:$HTTPS_PORT/login yet."
+    warn "Check: systemctl status watcher nginx   ·   journalctl -u watcher -n 50"
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    if ss -ltnH "sport = :$BPORT" | awk '{print $4}' | grep -qvE '^(127\.0\.0\.1|\[::1\]):'; then
+      warn "Backend port $BPORT is still listening on a non-loopback address."
+    else
+      ok "Backend port $BPORT listens on loopback only"
+    fi
+  fi
+
+  # ── Summary ──────────────────────────────────────────────────────────────
+  if [ "$VERIFIED" -ne 1 ]; then
+    say ""
+    say "┌──────────────────────────────────────────────────────────────────────┐"
+    say "  HTTPS setup did NOT verify — the dashboard may not be reachable."
+    say ""
+    say "  The configuration was applied but https://127.0.0.1:$HTTPS_PORT/login"
+    say "  did not return the Watcher login page. Check:"
+    say "    systemctl status watcher nginx"
+    say "    journalctl -u watcher -n 50      nginx -T | less"
+    say ""
+    say "  To return to plain HTTP on port $BPORT:  sudo watcher --remove-https"
+    say "└──────────────────────────────────────────────────────────────────────┘"
+    exit 1
+  fi
+  local FP PORTSFX=""
+  FP="$(openssl x509 -in "$CRT" -noout -fingerprint -sha256 | cut -d= -f2)"
+  [ "$HTTPS_PORT" -ne 443 ] && PORTSFX=":$HTTPS_PORT"
+  say ""
+  say "┌──────────────────────────────────────────────────────────────────────┐"
+  say "  Watcher IDS is now served over HTTPS"
+  say ""
+  say "    https://${CERT_HOST}${PORTSFX}/"
+  for ip in $(hostname -I 2>/dev/null || true); do
+    [[ "$ip" == *:* ]] && continue
+    say "    https://${ip}${PORTSFX}/"
+  done
+  say ""
+  say "  The certificate is self-signed, so browsers will show a warning the"
+  say "  first time. Confirm this SHA-256 fingerprint before accepting it:"
+  say "    $FP"
+  say ""
+  say "  Plain http://<host>:$BPORT/ is no longer reachable from the network."
+  say "  Undo:  sudo watcher --remove-https"
+  say "└──────────────────────────────────────────────────────────────────────┘"
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# --remove-https
+# ════════════════════════════════════════════════════════════════════════════
+remove_https() {
+  [ $# -eq 0 ] || die "--remove-https takes no options"
+  need_root
+  have_systemd || die "systemd (systemctl) is required"
+  say "Watcher IDS — removing HTTPS front end"
+
+  step "nginx"
+  if [ -e "$NGINX_CONF" ]; then
+    if grep -qF "$MARKER" "$NGINX_CONF"; then
+      rm -f "$NGINX_CONF"; ok "Removed $NGINX_CONF"
+    else
+      warn "$NGINX_CONF was not created by Watcher — left untouched."
+    fi
+  else
+    ok "No Watcher nginx site present"
+  fi
+  if [ "$(state_get DEFAULT_SITE_DISABLED)" = 1 ] && [ -e "$NGINX_DEFAULT_AVAILABLE" ] &&
+     [ ! -e "$NGINX_DEFAULT_ENABLED" ]; then
+    ln -s "$NGINX_DEFAULT_AVAILABLE" "$NGINX_DEFAULT_ENABLED"
+    if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+      rm -f "$NGINX_DEFAULT_ENABLED"
+      warn "Could not re-enable nginx's stock default site (config test failed) — left disabled."
+    else
+      ok "Re-enabled nginx's stock default site"
+    fi
+  fi
+  if command -v nginx >/dev/null 2>&1 && systemctl is-active --quiet nginx; then
+    if nginx -t >/dev/null 2>&1; then systemctl reload nginx; ok "nginx reloaded"
+    else warn "nginx config test failed — nginx not reloaded; check: nginx -t"; fi
+  fi
+
+  step "Backend bind address"
+  if [ -e "$DROPIN" ]; then
+    rm -f "$DROPIN"; rmdir "$DROPIN_DIR" 2>/dev/null || true
+    ok "Removed $DROPIN"
+  fi
+  systemctl daemon-reload
+  systemctl restart watcher && ok "watcher restarted (plain HTTP on its configured address)"
+
+  local INSTALLED; INSTALLED="$(state_get NGINX_INSTALLED_BY_WATCHER)"
+  rm -f "$STATE"
+  say ""
+  say "HTTPS front end removed. Certificates were kept in $TLS_DIR."
+  [ "$INSTALLED" = 1 ] && say "nginx was installed by --setup-https; if nothing else uses it:  sudo apt-get remove nginx"
+  return 0
+}
+
+# ════════════════════════════════════════════════════════════════════════════
+# --https-status
+# ════════════════════════════════════════════════════════════════════════════
+https_status() {
+  local BPORT; BPORT="$(backend_port)"
+  if [ -e "$NGINX_CONF" ] && grep -qF "$MARKER" "$NGINX_CONF" 2>/dev/null; then
+    say "HTTPS front end : configured ($NGINX_CONF)"
+  else
+    say "HTTPS front end : not configured   (enable: sudo watcher --setup-https)"
+  fi
+  if [ -r "$CRT" ]; then
+    say "Certificate     : $CRT"
+    say "  expires       : $(openssl x509 -in "$CRT" -noout -enddate 2>/dev/null | cut -d= -f2)"
+    say "  SHA-256       : $(openssl x509 -in "$CRT" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)"
+  elif [ -e "$CRT" ]; then
+    say "Certificate     : $CRT (run as root to inspect)"
+  fi
+  [ -e "$DROPIN" ] && say "Backend bind    : 127.0.0.1 (systemd drop-in $DROPIN)" \
+                   || say "Backend bind    : as configured in watcher.conf (default 0.0.0.0)"
+  if have_systemd; then
+    say "nginx service   : $(systemctl is-active nginx 2>/dev/null || true)"
+    say "watcher service : $(systemctl is-active watcher 2>/dev/null || true)"
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    say "Backend listens : $(ss -ltnH "sport = :$BPORT" 2>/dev/null | awk '{print $4}' | paste -sd' ' -)"
+  fi
+}
+
+# ── Dispatch ─────────────────────────────────────────────────────────────────
+CMD="${1:-}"
+[ $# -gt 0 ] && shift
+case "$CMD" in
+  --setup-https)  setup_https "$@" ;;
+  --remove-https) remove_https "$@" ;;
+  --https-status) https_status ;;
+  -h|--help)      usage ;;
+  "")             usage; exit 2 ;;
+  *)              usage >&2; die "unknown command: $CMD" ;;
+esac

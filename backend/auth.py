@@ -59,15 +59,39 @@ class AuthManager:
         c.commit()
 
     # ── Single-password (legacy / emergency fallback) ─────────────────────────
+    #
+    # Security (v1.8.0): the fallback password is honoured ONLY if an operator
+    # set it explicitly with `server.py --password` (which requires shell
+    # access as root/watcher).  Earlier versions auto-generated one on first
+    # start and printed it to the journal; that hash still exists on upgraded
+    # installs, but it has no 'pw_hash_explicit' marker and is therefore
+    # ignored.  Nothing is deleted — the old row simply stops granting access.
 
     def set_password(self, password: str):
+        """Set the emergency fallback password (operator CLI only)."""
         c = self._conn()
         c.execute(
             "INSERT OR REPLACE INTO auth (key, value) VALUES ('pw_hash', ?)",
             (hash_password(password),),
         )
+        c.execute(
+            "INSERT OR REPLACE INTO auth (key, value) VALUES ('pw_hash_explicit', '1')"
+        )
         c.commit()
-        log.info("Single-password updated.")
+        log.info("Emergency fallback password set (login as 'admin').")
+
+    def clear_password(self):
+        """Disable the emergency fallback login (operator CLI only)."""
+        c = self._conn()
+        c.execute("DELETE FROM auth WHERE key = 'pw_hash_explicit'")
+        c.commit()
+        log.info("Emergency fallback password disabled.")
+
+    def fallback_enabled(self) -> bool:
+        row = self._conn().execute(
+            "SELECT value FROM auth WHERE key = 'pw_hash_explicit'"
+        ).fetchone()
+        return bool(row and row[0] == "1")
 
     def get_hash(self) -> str | None:
         row = self._conn().execute(
@@ -76,7 +100,13 @@ class AuthManager:
         return row[0] if row else None
 
     def check_password(self, password: str) -> bool:
-        """Emergency fallback: checks against single stored password."""
+        """
+        Emergency fallback: checks against the single stored password.
+        Only an explicitly-set fallback password (see set_password) is
+        accepted; an auto-generated legacy hash is ignored.
+        """
+        if not self.fallback_enabled():
+            return False
         stored = self.get_hash()
         return bool(stored and verify_password(password, stored))
 
@@ -130,10 +160,11 @@ class AuthManager:
     def revoke_sessions_for_user(self, username: str):
         """Invalidate all active sessions belonging to a specific user."""
         c   = self._conn()
-        cur = c.execute("DELETE FROM sessions WHERE username = ?", (username,))
+        cur = c.execute("DELETE FROM sessions WHERE username = ? COLLATE NOCASE",
+                        (username,))
         c.commit()
         if cur.rowcount:
-            log.info("Revoked %d session(s) for user '%s' after password change.",
+            log.info("Revoked %d session(s) for user '%s'.",
                      cur.rowcount, username)
 
     def revoke_all_sessions(self):

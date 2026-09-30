@@ -64,6 +64,12 @@ class AlertDB:
             c.execute("CREATE INDEX IF NOT EXISTS idx_a_src_ip  ON alerts (src_ip)")
             # dst_ip: used by destination-IP search queries
             c.execute("CREATE INDEX IF NOT EXISTS idx_a_dst_ip  ON alerts (dst_ip)")
+            # (flow_id, ts): lets replay_eve() detect alerts already stored.
+            # Alert IDs carry a random suffix (Standing Rule 6), so the primary
+            # key alone can no longer de-duplicate a replayed event.
+            # Additive index — on a large existing DB the first start after
+            # upgrade builds it once (may take a little while).
+            c.execute("CREATE INDEX IF NOT EXISTS idx_a_flow_ts ON alerts (flow_id, ts)")
 
             # Migration: add ack columns to existing databases
             alert_cols = {r[1] for r in c.execute("PRAGMA table_info(alerts)").fetchall()}
@@ -146,6 +152,18 @@ class AlertDB:
             c.commit()
         except sqlite3.Error as e:
             log.warning("DB insert (alert): %s", e)
+
+    def alert_exists(self, flow_id, ts: str, sig_id) -> bool:
+        """
+        True if an alert with this (flow_id, timestamp, signature) is already
+        stored.  Used by replay to stay idempotent without weakening the
+        entropy-suffixed alert IDs used by the live tail.
+        """
+        row = self._conn().execute(
+            "SELECT 1 FROM alerts WHERE flow_id = ? AND ts = ? AND sig_id = ? LIMIT 1",
+            (flow_id, ts, sig_id),
+        ).fetchone()
+        return row is not None
 
     def fetch_recent(self, days=None, limit=300, offset=0, include_raw=False, **kwargs):
         """
@@ -453,6 +471,14 @@ class AlertDB:
         for table in self._PURGEABLE_TABLES:
             cur    = c.execute(self._PURGE_SQL[table], (cutoff,))
             total += cur.rowcount
+        # ack_history rows whose alert no longer exists (purged, cleared,
+        # flushed) were previously kept forever.  Only orphans are removed —
+        # history for alerts still in the database is untouched.
+        cur = c.execute(
+            "DELETE FROM ack_history WHERE alert_id NOT IN (SELECT id FROM alerts)"
+        )
+        if cur.rowcount:
+            log.info("Purged %d orphaned ack_history rows.", cur.rowcount)
         c.commit()
         if total:
             log.info("Purged %d total rows older than %d days.", total, self.retain_days)

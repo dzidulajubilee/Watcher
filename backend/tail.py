@@ -241,16 +241,21 @@ def replay_eve(path: str, db, registry,
                progress_cb=None) -> dict:
     """
     Read eve.json from the beginning and insert every event into the DB.
-    Existing records are skipped (upsert-on-conflict by ts+flow_id).
+    Alerts already stored (same flow_id + timestamp + signature) are skipped
+    via AlertDB.alert_exists() — alert IDs carry a random suffix, so the
+    primary key alone cannot de-duplicate.  Flows/DNS/HTTP use deterministic
+    keys and are de-duplicated by INSERT OR IGNORE.
     Called by the admin Data Control panel — runs in a background thread.
 
     Webhooks are intentionally NOT fired during replay; only live tail_thread
     events should trigger external notifications.
 
     progress_cb: optional callable(inserted, skipped, total_lines) for status updates.
-    Returns { inserted, skipped, errors, lines }.
+    Returns { inserted, skipped, errors, lines, suppressed, duplicates }.
+    skipped = suppressed + duplicates (kept for UI compatibility).
     """
     inserted = skipped = errors = lines = 0
+    suppressed = duplicates = 0
     log.info("Replay started: %s", path)
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -262,7 +267,10 @@ def replay_eve(path: str, db, registry,
                 try:
                     if etype == "alert":
                         if sup_db and sup_db.is_suppressed(parsed):
-                            skipped += 1
+                            skipped += 1; suppressed += 1
+                        elif db.alert_exists(parsed["flow_id"], parsed["ts"],
+                                             parsed["sig_id"]):
+                            skipped += 1; duplicates += 1
                         else:
                             db.insert(parsed)
                             registry.broadcast("alert", parsed)
@@ -286,12 +294,15 @@ def replay_eve(path: str, db, registry,
     except OSError as exc:
         log.error("Replay failed to open %s: %s", path, exc)
         return {"inserted": inserted, "skipped": skipped,
-                "errors": errors + 1, "lines": lines}
+                "errors": errors + 1, "lines": lines,
+                "suppressed": suppressed, "duplicates": duplicates}
 
-    log.info("Replay complete: %d lines, %d inserted, %d skipped, %d errors.",
-             lines, inserted, skipped, errors)
+    log.info("Replay complete: %d lines, %d inserted, %d skipped "
+             "(%d suppressed, %d already stored), %d errors.",
+             lines, inserted, skipped, suppressed, duplicates, errors)
     return {"inserted": inserted, "skipped": skipped,
-            "errors": errors, "lines": lines}
+            "errors": errors, "lines": lines,
+            "suppressed": suppressed, "duplicates": duplicates}
 
 
 def _auto_explain(alert: dict, engine, seen: set) -> None:

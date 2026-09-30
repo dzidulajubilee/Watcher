@@ -103,9 +103,14 @@ PYEOF
     # ── Install banner ────────────────────────────────────────────────────────
     echo ""
     echo "┌─────────────────────────────────────────────────────────┐"
-    echo "│  Watcher IDS v1.7.3 installed successfully              │"
+    echo "│  Watcher IDS v1.8.0 installed successfully              │"
     echo "│                                                         │"
+    if [ -f /etc/systemd/system/watcher.service.d/https.conf ]; then
+    echo "│  Dashboard  →  https://<this-host>/  (nginx, HTTPS)     │"
+    else
     echo "│  Dashboard  →  http://localhost:8765/                   │"
+    echo "│  HTTPS      →  sudo watcher --setup-https               │"
+    fi
     echo "│  Logs       →  journalctl -u watcher -f                 │"
     echo "│  Status     →  systemctl status watcher                 │"
     echo "│  Config     →  /etc/watcher/watcher.conf                │"
@@ -121,7 +126,17 @@ PYEOF
     fi
 
     echo "│                                                         │"
-    echo "│  What's new in v1.7.3:                                  │"
+    echo "│  What's new in v1.8.0:                                  │"
+    echo "│    • HTTPS: sudo watcher --setup-https (nginx +         │"
+    echo "│      self-signed cert; backend bound to 127.0.0.1)      │"
+    echo "│    • Security: no auto-generated fallback password;     │"
+    echo "│      sessions revoked on demote/disable/delete;         │"
+    echo "│      webhook URLs admin-only; stronger SSRF checks      │"
+    echo "│    • Fix: live stream no longer stalls after bursts     │"
+    echo "│    • Fix: replay no longer duplicates stored alerts     │"
+    echo "│    • AI prompts no longer include internal IPs          │"
+    echo "│                                                         │"
+    echo "│  v1.7.3:                                                │"
     echo "│    • Fix: replay no longer fires live webhooks          │"
     echo "│    • Fix: alert ID collision under high traffic         │"
     echo "│      (entropy suffix — no more silent drops)            │"

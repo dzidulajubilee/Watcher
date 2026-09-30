@@ -20,7 +20,7 @@ if [[ -z "$VERSION" ]]; then
   if [[ -f "$CTRL" ]]; then
     VERSION="$(grep '^Version:' "$CTRL" | awk '{print $2}')"
   fi
-  VERSION="${VERSION:-1.7.2}"
+  VERSION="${VERSION:-1.8.0}"
 fi
 
 echo "╔══════════════════════════════════════════════════════════════╗"
@@ -76,6 +76,7 @@ build_deb() {
     "$PKG_ROOT/opt/watcher/frontend/fonts" \
     "$PKG_ROOT/var/lib/watcher" \
     "$PKG_ROOT/lib/systemd/system" \
+    "$PKG_ROOT/usr/bin" \
     "$PKG_ROOT/etc/watcher"
 
   # ── DEBIAN/control ──────────────────────────────────────────────────
@@ -86,6 +87,7 @@ Section: net
 Priority: optional
 Architecture: all
 Depends: python3 (>= 3.10)
+Suggests: nginx, openssl
 Maintainer: Watcher IDS <watcher@localhost>
 License: AGPL-3.0-or-later
 Description: Watcher IDS Dashboard${PKG_SUFFIX:+ (AI-free build)}
@@ -148,6 +150,11 @@ PYEOF
   cp "$FRONTEND_SRC/login.js"   "$PKG_ROOT/opt/watcher/frontend/"
   cp "$FRONTEND_SRC/assets/"*   "$PKG_ROOT/opt/watcher/frontend/assets/"
   cp "$FRONTEND_SRC/fonts/"*    "$PKG_ROOT/opt/watcher/frontend/fonts/"
+
+  # ── Admin CLI (watcher --setup-https etc.) ───────────────────────────
+  cp "$PKGSRC/watcher-cli" "$PKG_ROOT/usr/bin/watcher"
+  chmod 755 "$PKG_ROOT/usr/bin/watcher"
+  bash -n "$PKG_ROOT/usr/bin/watcher" || { echo "   FAIL: watcher-cli syntax"; exit 1; }
 
   # ── Systemd + config ─────────────────────────────────────────────────
   cp "$PKGSRC/watcher.service" "$PKG_ROOT/lib/systemd/system/watcher.service"
@@ -223,6 +230,11 @@ cp "$SCRIPT_DIR/packaging/prerm"          "$ZIP_STAGE/packaging/"
 cp "$SCRIPT_DIR/packaging/postrm"         "$ZIP_STAGE/packaging/"
 cp "$SCRIPT_DIR/packaging/watcher.conf"   "$ZIP_STAGE/packaging/"
 cp "$SCRIPT_DIR/packaging/watcher.service" "$ZIP_STAGE/packaging/"
+cp "$SCRIPT_DIR/packaging/watcher-cli"    "$ZIP_STAGE/packaging/"
+
+# Regression tests (stdlib unittest)
+mkdir -p "$ZIP_STAGE/tests"
+cp "$SCRIPT_DIR/tests/"*.py "$ZIP_STAGE/tests/"
 
 # Strip script + build script
 cp "$SCRIPT_DIR/strip-ai.py"  "$ZIP_STAGE/"

@@ -180,7 +180,11 @@ class ExplainEngine:
         return self._db.get_setting("ai_enabled", "1") == "1"
 
     def active_provider(self) -> str:
-        p = self._db.get_setting("ai_provider", DEFAULT_PROVIDER)
+        # Priority: Settings UI (DB) → AI_PROVIDER in watcher.conf → default.
+        # (AI_PROVIDER was documented in watcher.conf but previously ignored.)
+        p = (self._db.get_setting("ai_provider")
+             or os.environ.get("AI_PROVIDER", "").strip().lower()
+             or DEFAULT_PROVIDER)
         return p if p in PROVIDERS else DEFAULT_PROVIDER
 
     def _api_key(self, provider: str) -> str | None:
@@ -272,10 +276,11 @@ class ExplainEngine:
             lines.append(f"Category : {alert['category']}")
         if alert.get("severity"):
             lines.append(f"Severity : {alert['severity']}")
-        if alert.get("src_ip"):
-            lines.append(f"Source   : {alert['src_ip']}")
-        if alert.get("dest_ip"):
-            lines.append(f"Dest     : {alert['dest_ip']}")
+        # Source/destination IPs are intentionally NOT sent (v1.8.0):
+        #  • privacy — internal addressing must not leave the network, and
+        #  • accuracy — results are cached per sig_id and reused for every
+        #    later alert with that signature, so host-specific wording from
+        #    the first alert would be shown against unrelated hosts.
         if alert.get("proto"):
             lines.append(f"Protocol : {alert['proto'].upper()}")
         lines += [

@@ -42,6 +42,21 @@ _PRIVATE_NETWORKS = [
 
 _ALLOWED_SCHEMES = {"http", "https"}
 
+
+def _is_blocked_address(addr) -> bool:
+    """
+    True if `addr` must not be a webhook destination when Allow Local IPs is
+    off.  Uses ipaddress's own classification so it also covers ranges the
+    explicit list above misses: 0.0.0.0 (reaches localhost on Linux),
+    IPv4-mapped IPv6 (::ffff:127.0.0.1), IPv6 link-local (fe80::/10),
+    CGNAT 100.64.0.0/10, multicast, and other reserved space.
+    """
+    if getattr(addr, "ipv4_mapped", None) is not None:
+        addr = addr.ipv4_mapped
+    if any(addr in net for net in _PRIVATE_NETWORKS if net.version == addr.version):
+        return True
+    return (not addr.is_global) or addr.is_multicast or addr.is_unspecified
+
 # ── Webhook list in-memory cache (P-01 fix) ───────────────────────────────────
 # dispatch() is called on every alert; caching avoids a DB round-trip each time.
 _wh_cache: list = []
@@ -87,16 +102,15 @@ def validate_webhook_url(url: str, allow_local: bool = False) -> str | None:
     for info in infos:
         addr_str = info[4][0]
         try:
-            addr = ipaddress.ip_address(addr_str)
+            addr = ipaddress.ip_address(addr_str.split("%", 1)[0])
         except ValueError:
             continue
-        for net in _PRIVATE_NETWORKS:
-            if addr in net:
-                return (
-                    f"URL resolves to private/loopback address {addr_str}. "
-                    "Enable 'Allow Local IPs' in Webhook settings if your "
-                    "webhook target (e.g. n8n) is on the local network."
-                )
+        if _is_blocked_address(addr):
+            return (
+                f"URL resolves to private/loopback address {addr_str}. "
+                "Enable 'Allow Local IPs' in Webhook settings if your "
+                "webhook target (e.g. n8n) is on the local network."
+            )
     return None
 
 
@@ -394,8 +408,9 @@ def deliver(url: str, payload: dict, allow_local: bool = False) -> str | None:
         headers={"Content-Type": "application/json", "User-Agent": "Watcher-IDS/1.0"},
         method="POST",
     )
+    opener = urllib.request.build_opener(_SafeRedirectHandler(allow_local))
     try:
-        with urllib.request.urlopen(req, timeout=DELIVERY_TIMEOUT) as resp:
+        with opener.open(req, timeout=DELIVERY_TIMEOUT) as resp:
             status = resp.status
             if 200 <= status < 300:
                 return None
@@ -406,6 +421,24 @@ def deliver(url: str, payload: dict, allow_local: bool = False) -> str | None:
         return f"URLError: {e.reason}"
     except Exception as e:
         return f"Error: {e}"
+
+
+# ── Redirect re-validation ────────────────────────────────────────────────────
+# urllib follows 30x redirects by default.  Without this handler a public URL
+# could redirect delivery to an internal address and bypass the SSRF check,
+# which only ran on the original URL.
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, allow_local: bool):
+        super().__init__()
+        self.allow_local = allow_local
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        err = validate_webhook_url(newurl, allow_local=self.allow_local)
+        if err:
+            raise urllib.error.HTTPError(
+                newurl, code, f"Blocked redirect: {err}", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 # ── Delivery queue + worker ────────────────────────────────────────────────────

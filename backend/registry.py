@@ -75,6 +75,16 @@ class Registry:
 
     # ── Info ──────────────────────────────────────────────────────────────────
 
+    def is_registered(self, cid: int) -> bool:
+        """
+        True while `cid` is still receiving broadcasts.  broadcast() drops
+        clients whose queue is full; the SSE handler polls this so it can
+        close the dropped client's stream — the browser's EventSource then
+        reconnects and resumes receiving live events.
+        """
+        with self._lock:
+            return cid in self._clients
+
     def count(self) -> int:
         """Return the number of currently connected clients."""
         with self._lock:

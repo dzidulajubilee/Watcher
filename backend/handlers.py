@@ -2,6 +2,7 @@
 Watcher IDS Dashboard — HTTP Request Handler
 """
 
+import ipaddress
 import json
 import logging
 import re
@@ -40,6 +41,38 @@ class Handler(BaseHTTPRequestHandler):
 
     server_version = ""
     sys_version    = ""
+
+    # ── Reverse-proxy awareness (watcher --setup-https) ───────────────────────
+    # nginx forwards the real client address in X-Real-IP and the original
+    # scheme in X-Forwarded-Proto.  These headers are trusted ONLY when the
+    # TCP peer is loopback (i.e. the local nginx); from any other peer they
+    # are ignored, so remote clients cannot spoof their address.
+
+    def _peer_is_loopback(self) -> bool:
+        try:
+            return ipaddress.ip_address(self.client_address[0]).is_loopback
+        except (ValueError, IndexError, TypeError):
+            return False
+
+    def address_string(self):
+        """Client IP for logs and login rate limiting (proxy-aware)."""
+        headers = getattr(self, "headers", None)
+        if headers is not None and self._peer_is_loopback():
+            real = (headers.get("X-Real-IP") or "").strip()
+            if real:
+                try:
+                    return str(ipaddress.ip_address(real))
+                except ValueError:
+                    pass
+        return self.client_address[0]
+
+    def _cookie_secure_attr(self) -> str:
+        """'; Secure' when the browser reached us over HTTPS via local nginx."""
+        headers = getattr(self, "headers", None)
+        if (headers is not None and self._peer_is_loopback() and
+                (headers.get("X-Forwarded-Proto") or "").lower() == "https"):
+            return "; Secure"
+        return ""
 
     def log_message(self, fmt, *args):
         first = str(args[0]) if args else ""
@@ -188,6 +221,34 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError):
             return default
 
+    @staticmethod
+    def _opt_int(value):
+        """
+        Validate an optional integer field from a request body/query.
+        Returns (True, int|None) when valid — empty/None means "not set" —
+        or (False, None) when the value is present but not an integer.
+        """
+        if value is None or value == "":
+            return True, None
+        if isinstance(value, bool):
+            return False, None
+        try:
+            return True, int(value)
+        except (ValueError, TypeError):
+            return False, None
+
+    @staticmethod
+    def _opt_float(value):
+        """Same contract as _opt_int, for epoch timestamps."""
+        if value is None or value == "":
+            return True, None
+        if isinstance(value, bool):
+            return False, None
+        try:
+            return True, float(value)
+        except (ValueError, TypeError):
+            return False, None
+
     # ── Routing ───────────────────────────────────────────────────────────────
 
     def do_GET(self):
@@ -228,6 +289,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(raw)
         elif path == "/webhooks":
+            # Admin-only: webhook URLs embed secret tokens (Slack/Discord).
+            # The UI only uses this list in the admin Settings view.
+            if not self._require_role("admin"): return
             self._json(self.wdb.get_all())
         elif path == "/settings/explain":
             if not self._require_auth(): return
@@ -252,10 +316,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/threat-intel":
             self._json(self.ti_db.get_all())
         elif path == "/threat-intel/lookup":
-            sid = qs.get("sig_id", [None])[0]
+            ok, sid = self._opt_int(qs.get("sig_id", [None])[0])
+            if not ok:
+                self._json({"error": "sig_id must be an integer"}, 400); return
             cat = qs.get("category", [None])[0]
-            self._json(self.ti_db.lookup(
-                sig_id=int(sid) if sid else None, category=cat) or {})
+            self._json(self.ti_db.lookup(sig_id=sid, category=cat) or {})
         elif path == "/threat-intel/gaps":
             top = self.db.top_sids(limit=200)
             self._json(self.ti_db.coverage_gaps(top, limit=20))
@@ -451,7 +516,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Set-Cookie",
                 f"suri_session={token}; Path=/; HttpOnly; "
-                f"SameSite=Strict; Max-Age={SESSION_TTL}")
+                f"SameSite=Strict; Max-Age={SESSION_TTL}"
+                f"{self._cookie_secure_attr()}")
             self.send_header("Content-Length", str(len(resp)))
             self.end_headers()
             self.wfile.write(resp)
@@ -467,7 +533,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(302)
         self.send_header("Location", "/login")
         self.send_header("Set-Cookie",
-            "suri_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+            "suri_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+            f"{self._cookie_secure_attr()}")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -646,19 +713,34 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body is None: return
         pw = str(body.pop("password", "")).strip()
+        # ── Validate everything BEFORE writing anything ──────────────────────
+        # (Previously the password was changed first, so a request rejected
+        #  below for an invalid role / last-admin rule still changed it.)
+        if body.get("role") and body["role"] not in ("admin", "analyst", "viewer"):
+            self._json({"error": "Invalid role"}, 400); return
+        disabling = "enabled" in body and not body["enabled"]
+        if user["role"] == "admin" and self.um.count_admins() <= 1:
+            if body.get("role") and body["role"] != "admin":
+                self._json({"error": "Cannot demote the last admin"}, 400); return
+            if disabling:
+                self._json({"error": "Cannot disable the last admin"}, 400); return
+        # ── Apply ─────────────────────────────────────────────────────────────
         if pw:
             self.um.set_password(uid, pw)
             # Invalidate all active sessions for this user so re-login is forced
             self.auth.revoke_sessions_for_user(user.get("username", ""))
-        if body.get("role") and body["role"] not in ("admin", "analyst", "viewer"):
-            self._json({"error": "Invalid role"}, 400); return
-        if user["role"] == "admin" and self.um.count_admins() <= 1:
-            if body.get("role") and body["role"] != "admin":
-                self._json({"error": "Cannot demote the last admin"}, 400); return
-            if body.get("enabled") is False:
-                self._json({"error": "Cannot disable the last admin"}, 400); return
         updated = self.um.update(uid, **{k: v for k, v in body.items()
                                           if k in ("role", "enabled", "username")})
+        # Sessions carry username + role and are trusted for their lifetime,
+        # so any change to who this user is or what they may do must end
+        # their existing sessions (otherwise a demoted/disabled user keeps
+        # their old privileges for up to SESSION_TTL).
+        role_changed = bool(body.get("role")) and body["role"] != user["role"]
+        name_changed = (bool(body.get("username")) and
+                        str(body["username"]).strip().lower()
+                        != user["username"].lower())
+        if role_changed or disabling or name_changed:
+            self.auth.revoke_sessions_for_user(user["username"])
         self._json(updated)
 
     def _user_delete(self, uid):
@@ -672,6 +754,7 @@ class Handler(BaseHTTPRequestHandler):
         if s and s["username"].lower() == user["username"].lower():
             self._json({"error": "Cannot delete your own account"}, 400); return
         self.um.delete(uid)
+        self.auth.revoke_sessions_for_user(user["username"])
         self._json({"deleted": uid})
 
     # ── Threat Intel ──────────────────────────────────────────────────────────
@@ -683,7 +766,9 @@ class Handler(BaseHTTPRequestHandler):
         explanation = str(body.get("explanation", "")).strip()
         if not explanation:
             self._json({"error": "explanation is required"}, 400); return
-        sig_id   = body.get("sig_id")
+        ok, sig_id = self._opt_int(body.get("sig_id"))
+        if not ok:
+            self._json({"error": "sig_id must be an integer"}, 400); return
         category = str(body.get("category", "")).strip() or None
         if not sig_id and not category:
             self._json({"error": "Either sig_id or category is required"}, 400); return
@@ -704,6 +789,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "Not found"}, 404); return
         body = self._read_json()
         if body is None: return
+        if "sig_id" in body and not self._opt_int(body["sig_id"])[0]:
+            self._json({"error": "sig_id must be an integer"}, 400); return
         self._json(self.ti_db.update(tid, **body))
 
     def _ti_delete(self, tid):
@@ -720,7 +807,12 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body is None: return
         name     = str(body.get("name", "")).strip()
-        sig_id   = body.get("sig_id")
+        ok, sig_id = self._opt_int(body.get("sig_id"))
+        if not ok:
+            self._json({"error": "sig_id must be an integer"}, 400); return
+        ok, expires_at = self._opt_float(body.get("expires_at"))
+        if not ok:
+            self._json({"error": "expires_at must be an epoch timestamp"}, 400); return
         src_ip   = str(body.get("src_ip",   "")).strip() or None
         category = str(body.get("category", "")).strip() or None
         if not name:
@@ -735,7 +827,7 @@ class Handler(BaseHTTPRequestHandler):
             src_ip     = src_ip,
             category   = category,
             reason     = str(body.get("reason", "")).strip() or None,
-            expires_at = body.get("expires_at"),
+            expires_at = expires_at,
             created_by = s["username"] if s else "",
         ), 201)
 
@@ -745,6 +837,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "Not found"}, 404); return
         body = self._read_json()
         if body is None: return
+        if "sig_id" in body and not self._opt_int(body["sig_id"])[0]:
+            self._json({"error": "sig_id must be an integer"}, 400); return
+        if "expires_at" in body and not self._opt_float(body["expires_at"])[0]:
+            self._json({"error": "expires_at must be an epoch timestamp"}, 400); return
         self._json(self.sup_db.update(rule_id, **body))
 
     def _sup_delete(self, rule_id):
@@ -777,6 +873,14 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 msg = q.get(timeout=PING_EVERY)
             except Empty:
+                # Queue drained and idle. If the registry dropped this client
+                # (its queue overflowed during a burst), no further events
+                # will ever arrive here — close the stream instead of pinging
+                # forever, so the browser's EventSource reconnects cleanly.
+                if not self.registry.is_registered(cid):
+                    log.info("SSE client %d was dropped (slow consumer) — "
+                             "closing stream so it reconnects.", cid)
+                    break
                 msg = f"event: ping\ndata: {int(time.time())}\n\n"
             try:
                 self.wfile.write(msg.encode())
@@ -785,6 +889,12 @@ class Handler(BaseHTTPRequestHandler):
                 break
 
         self.registry.remove(cid)
+        # The "Connection: keep-alive" header sent above makes
+        # BaseHTTPRequestHandler keep the socket open for another request
+        # after this method returns.  An SSE response has no Content-Length,
+        # so the browser only sees the stream end when the socket closes —
+        # force the close so EventSource's onerror/reconnect fires.
+        self.close_connection = True
 
     # ── AI Explain ────────────────────────────────────────────────────────────
 
@@ -802,6 +912,13 @@ class Handler(BaseHTTPRequestHandler):
             sig_id = int(sig_id)
         except (ValueError, TypeError):
             self._json({"error": "sig_id must be an integer"}, 400); return
+
+        # Forced regeneration bypasses the cache and always calls the paid
+        # provider API — restrict it to the roles the UI offers it to.
+        # (Checked before the key check so authorization never depends on
+        #  configuration state.)
+        if bool(body.get("force", False)) and self._role() not in ("admin", "analyst"):
+            self._json({"error": "Forbidden"}, 403); return
 
         if not self.explain_engine.has_key():
             from explain import PROVIDERS as _AI_P
@@ -930,13 +1047,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "Maximum 5,000 entries per import."}, 400)
             return
 
-        # Identify caller for audit trail
-        token = self.headers.get("Cookie", "")
-        try:
-            tok = token.split("token=")[1].split(";")[0].strip()
-            caller = (self.auth.validate(tok) or {}).get("username", "import")
-        except Exception:
-            caller = "import"
+        # Identify caller for audit trail (previously parsed the wrong cookie
+        # name and called a non-existent method, so every import was
+        # recorded as "import").
+        s      = self._session()
+        caller = (s["username"] if s and s.get("username") else "import")
 
         result = self.ti_db.import_entries(entries, imported_by=caller)
         self._json(result, 200)
