@@ -20,7 +20,7 @@ if [[ -z "$VERSION" ]]; then
   if [[ -f "$CTRL" ]]; then
     VERSION="$(grep '^Version:' "$CTRL" | awk '{print $2}')"
   fi
-  VERSION="${VERSION:-1.8.0}"
+  VERSION="${VERSION:-1.10.0}"
 fi
 
 echo "╔══════════════════════════════════════════════════════════════╗"
@@ -107,7 +107,7 @@ CTRL
   cp "$PKGSRC/postinst"       "$PKG_ROOT/DEBIAN/postinst"
   cp "$PKGSRC/prerm"          "$PKG_ROOT/DEBIAN/prerm"
   cp "$PKGSRC/postrm"         "$PKG_ROOT/DEBIAN/postrm"
-  echo "/etc/watcher/watcher.conf" > "$PKG_ROOT/DEBIAN/conffiles"
+  printf '%s\n' /etc/watcher/watcher.conf /etc/watcher/backup.conf > "$PKG_ROOT/DEBIAN/conffiles"
   chmod 755 "$PKG_ROOT/DEBIAN/postinst" \
             "$PKG_ROOT/DEBIAN/prerm" \
             "$PKG_ROOT/DEBIAN/postrm"
@@ -159,6 +159,9 @@ PYEOF
   # ── Systemd + config ─────────────────────────────────────────────────
   cp "$PKGSRC/watcher.service" "$PKG_ROOT/lib/systemd/system/watcher.service"
   cp "$PKGSRC/watcher.conf"    "$PKG_ROOT/etc/watcher/watcher.conf"
+  cp "$PKGSRC/backup.conf"     "$PKG_ROOT/etc/watcher/backup.conf"
+  cp "$PKGSRC/watcher-backup.service" "$PKG_ROOT/lib/systemd/system/watcher-backup.service"
+  cp "$PKGSRC/watcher-backup.timer"   "$PKG_ROOT/lib/systemd/system/watcher-backup.timer"
 
   chmod 755 "$PKG_ROOT/var/lib/watcher" "$PKG_ROOT/etc/watcher"
 
@@ -231,6 +234,8 @@ cp "$SCRIPT_DIR/packaging/postrm"         "$ZIP_STAGE/packaging/"
 cp "$SCRIPT_DIR/packaging/watcher.conf"   "$ZIP_STAGE/packaging/"
 cp "$SCRIPT_DIR/packaging/watcher.service" "$ZIP_STAGE/packaging/"
 cp "$SCRIPT_DIR/packaging/watcher-cli"    "$ZIP_STAGE/packaging/"
+cp "$SCRIPT_DIR/packaging/backup.conf"    "$ZIP_STAGE/packaging/"
+cp "$SCRIPT_DIR/packaging/watcher-backup.service" "$SCRIPT_DIR/packaging/watcher-backup.timer" "$ZIP_STAGE/packaging/"
 
 # Regression tests (stdlib unittest)
 mkdir -p "$ZIP_STAGE/tests"

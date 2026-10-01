@@ -219,6 +219,44 @@ export default function App() {
         } catch {}
       });
 
+      // v1.10: flows / DNS arrive as once-per-second batches (the backend no
+      // longer streams them one by one — at thousands of events/s a browser
+      // cannot keep up). items are oldest → newest; the lists show newest first.
+      es.addEventListener('flow_batch', e => {
+        try {
+          const { items } = JSON.parse(e.data);
+          if (!Array.isArray(items) || items.length === 0) return;
+          setFlows(prev => {
+            const seen = new Set(prev.map(x => x.flow_id));
+            const add  = [];
+            for (let i = items.length - 1; i >= 0; i--) {
+              const evt = items[i];
+              if (seen.has(evt.flow_id)) continue;
+              seen.add(evt.flow_id);
+              add.push({ ...evt, tsStr: fmtTime(evt.ts) });
+            }
+            if (add.length === 0) return prev;
+            const next = [...add, ...prev];
+            return next.length > MAX_ALERTS ? next.slice(0, MAX_ALERTS) : next;
+          });
+        } catch {}
+      });
+
+      es.addEventListener('dns_batch', e => {
+        try {
+          const { items } = JSON.parse(e.data);
+          if (!Array.isArray(items) || items.length === 0) return;
+          const add = [];
+          for (let i = items.length - 1; i >= 0; i--) {
+            add.push({ ...items[i], tsStr: fmtTime(items[i].ts) });
+          }
+          setDnsEvents(prev => {
+            const next = [...add, ...prev];
+            return next.length > MAX_ALERTS ? next.slice(0, MAX_ALERTS) : next;
+          });
+        } catch {}
+      });
+
       es.onerror = () => {
         es.close();
         fetch('/health')

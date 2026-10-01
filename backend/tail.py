@@ -7,6 +7,7 @@ Background thread that tails eve.json and dispatches all event types:
 import json
 import logging
 import os
+from collections import deque
 import secrets
 import threading
 import time
@@ -148,6 +149,30 @@ def _http_summary(evt: dict) -> dict:
     }
 
 
+# ── Group commit tuning ────────────────────────────────────────────────────
+# Events are written in batches: one transaction per BATCH_MAX_EVENTS events
+# or per BATCH_MAX_WAIT seconds, whichever comes first — and immediately
+# whenever the reader has caught up with eve.json, so a quiet sensor sees no
+# added latency.  Under sustained load the added latency is at most
+# BATCH_MAX_WAIT.  Dashboards and webhooks are notified only after the batch
+# is committed, so what they show is always stored.
+BATCH_MAX_EVENTS = 500
+BATCH_MAX_WAIT   = 0.10    # seconds
+
+# ── Live view batching (v1.10) ─────────────────────────────────────────────
+# Flow / DNS / HTTP events are NOT streamed to browsers one by one: at
+# thousands of events per second a browser cannot keep up, its SSE queue
+# overflows, and it is disconnected (missing alerts while it reconnects).
+# Instead, once per LIVE_BATCH_INTERVAL the most recent LIVE_BATCH_MAX
+# summaries of each type are sent as one '<type>_batch' SSE event:
+#     {"items": [oldest … newest], "count": <events in the interval>,
+#      "interval": <seconds>}
+# Alerts are still streamed individually and immediately.  All events are
+# stored regardless; this only affects the live view.
+LIVE_BATCH_INTERVAL = 1.0   # seconds
+LIVE_BATCH_MAX      = 200   # most recent items per type per interval
+
+
 def tail_thread(path: str, db, registry, wdb=None, dns_db=None, sup_db=None,
                explain_engine=None):
     """
@@ -156,6 +181,10 @@ def tail_thread(path: str, db, registry, wdb=None, dns_db=None, sup_db=None,
     dns_db: DnsDB instance — if provided, DNS events go here instead of db.
     explain_engine: optional ExplainEngine — auto-generates executive summaries
       for new sig_ids in the background (one call per unique SID, cached).
+
+    v1.9: reads complete lines only (a line Suricata has only half-written is
+    left for the next read instead of being parsed and lost), tracks the file
+    position in bytes (no per-line tell()), and group-commits events.
     """
     # Track which sig_ids we have already queued for auto-explain this session.
     _explained_sids: set = set()
@@ -168,54 +197,107 @@ def tail_thread(path: str, db, registry, wdb=None, dns_db=None, sup_db=None,
     except OSError:
         log.warning("Eve file not found yet — will wait.")
 
+    b_alerts, b_flows, b_dns, b_http = [], [], [], []
+    pending, first_at = 0, 0.0
+    warned_no_dns_db = False
+
+    live_items  = {k: deque(maxlen=LIVE_BATCH_MAX) for k in ("flow", "dns", "http")}
+    live_counts = {k: 0 for k in live_items}
+    live_last   = [time.monotonic()]
+
+    def emit_live(force: bool = False):
+        now = time.monotonic()
+        if not force and now - live_last[0] < LIVE_BATCH_INTERVAL:
+            return
+        interval = round(now - live_last[0], 3)
+        live_last[0] = now
+        for kind, items in live_items.items():
+            if live_counts[kind]:
+                registry.broadcast(f"{kind}_batch", {"items": list(items),
+                                                     "count": live_counts[kind],
+                                                     "interval": interval})
+                items.clear()
+                live_counts[kind] = 0
+
+    def flush():
+        nonlocal b_alerts, b_flows, b_dns, b_http, pending, warned_no_dns_db
+        if not pending:
+            return
+        db.insert_batch(alerts=b_alerts, flows=b_flows, http=b_http)
+        if dns_db is not None:
+            dns_db.insert_batch(b_dns)
+        elif b_dns and not warned_no_dns_db:
+            log.warning("No DNS database configured — DNS events are not stored.")
+            warned_no_dns_db = True
+        # Publish only after the batch is committed.
+        for parsed in b_alerts:
+            registry.broadcast("alert", parsed)
+            if wdb is not None:
+                _webhook_dispatch(parsed, wdb)
+            # ── Auto-explain (background, per unique SID) ──
+            if explain_engine is not None:
+                _auto_explain(parsed, explain_engine,
+                              _explained_sids)
+        # Flow/DNS/HTTP: summarised into the once-per-second live batches.
+        # Only the last LIVE_BATCH_MAX of each type can be shown, so skip
+        # building summaries that would be discarded immediately.
+        for kind, events, summarise in (("flow", b_flows, _flow_summary),
+                                        ("dns",  b_dns,   _dns_summary),
+                                        ("http", b_http,  _http_summary)):
+            if events:
+                live_counts[kind] += len(events)
+                live_items[kind].extend(summarise(e) for e in events[-LIVE_BATCH_MAX:])
+        b_alerts, b_flows, b_dns, b_http = [], [], [], []
+        pending = 0
+        emit_live()
+
     while True:
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
+            with open(path, "rb") as f:
                 f.seek(pos)
                 while True:
                     line = f.readline()
-                    if line:
-                        etype, parsed = parse_eve_line(line)
-
+                    if line.endswith(b"\n"):
+                        pos += len(line)
+                        etype, parsed = parse_eve_line(
+                            line.decode("utf-8", errors="replace"))
+                        if etype is None:
+                            continue
                         if etype == "alert":
                             if sup_db is not None and sup_db.is_suppressed(parsed):
-                                pass  # silenced by suppression rule
-                            else:
-                                db.insert(parsed)
-                                registry.broadcast("alert", parsed)
-                                if wdb is not None:
-                                    _webhook_dispatch(parsed, wdb)
-                                # ── Auto-explain (background, per unique SID) ──
-                                if explain_engine is not None:
-                                    _auto_explain(parsed, explain_engine,
-                                                  _explained_sids)
-
+                                continue          # silenced by suppression rule
+                            b_alerts.append(parsed)
                         elif etype == "flow":
-                            db.insert_flow(parsed)
-                            registry.broadcast("flow", _flow_summary(parsed))
-
+                            b_flows.append(parsed)
                         elif etype == "dns":
-                            if dns_db is not None:
-                                dns_db.insert(parsed)
-                            else:
-                                db.insert_dns(parsed)
-                            registry.broadcast("dns", _dns_summary(parsed))
-
+                            b_dns.append(parsed)
                         elif etype == "http":
-                            db.insert_http(parsed)
-                            registry.broadcast("http", _http_summary(parsed))
+                            b_http.append(parsed)
+                        pending += 1
+                        if pending == 1:
+                            first_at = time.monotonic()
+                        if (pending >= BATCH_MAX_EVENTS or
+                                time.monotonic() - first_at >= BATCH_MAX_WAIT):
+                            flush()
+                        continue
 
-                        pos = f.tell()
-                    else:
-                        try:
-                            if os.path.getsize(path) < pos:
-                                log.info("Log rotation detected — rewinding.")
-                                pos = 0
-                                break
-                        except OSError:
-                            pass
-                        time.sleep(0.1)
+                    # No complete line available: either EOF, or Suricata is
+                    # mid-write.  Leave a partial line in the file for the next
+                    # read, publish what we have, then wait.
+                    if line:
+                        f.seek(pos)
+                    flush()
+                    emit_live()          # keep the live view current when idle
+                    try:
+                        if os.path.getsize(path) < pos:
+                            log.info("Log rotation detected — rewinding.")
+                            pos = 0
+                            break
+                    except OSError:
+                        pass
+                    time.sleep(0.1)
         except OSError as exc:
+            flush()
             log.warning("Cannot open %s: %s — retrying in 3 s.", path, exc)
             time.sleep(3)
 
@@ -281,9 +363,7 @@ def replay_eve(path: str, db, registry,
                     elif etype == "dns":
                         if dns_db:
                             dns_db.insert(parsed)
-                        else:
-                            db.insert_dns(parsed)
-                        inserted += 1
+                            inserted += 1
                     elif etype == "http":
                         db.insert_http(parsed); inserted += 1
                     if progress_cb and lines % 1000 == 0:

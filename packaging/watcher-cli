@@ -55,6 +55,13 @@ Commands:
                        loopback bind; the dashboard is served on plain HTTP
                        port 8765 again (requires root). Certificates are kept.
   --https-status       Show HTTPS configuration, certificate and bind status.
+  --backup-now         Back up the databases now (requires root).
+  --list-backups       List backups.
+  --restore NAME       Restore a backup (requires root). Stops the service,
+                       moves the current databases aside (not deleted),
+                       restores, and starts the service again.
+      --only LIST      Restore only some databases: config,events,dns
+      --yes            Do not ask for confirmation.
   -h, --help           Show this help.
 
 Options for --setup-https:
@@ -143,6 +150,80 @@ PYEOF
 foreign_listener() {
   command -v ss >/dev/null 2>&1 || return 1
   ss -ltnpH "sport = :$1" 2>/dev/null | grep -v '"nginx"' | grep -q . 
+}
+
+BACKUP_CONF=/etc/watcher/backup.conf
+BACKUP_PY=/opt/watcher/backup.py
+
+# Run backup.py with the settings from backup.conf.  $1 = user to run as.
+run_backup_py() {
+  local as="$1"; shift
+  [ -f "$BACKUP_PY" ] || die "Watcher IDS does not appear to be installed ($BACKUP_PY missing)"
+  (
+    set -a
+    # shellcheck disable=SC1090
+    [ -r "$BACKUP_CONF" ] && . "$BACKUP_CONF"
+    set +a
+    local vars=(BACKUP_DIR="${BACKUP_DIR:-/var/backups/watcher}"
+                BACKUP_KEEP="${BACKUP_KEEP:-2}"
+                BACKUP_DATABASES="${BACKUP_DATABASES:-config events dns}"
+                BACKUP_VERIFY="${BACKUP_VERIFY:-yes}"
+                BACKUP_MIN_FREE_PERCENT="${BACKUP_MIN_FREE_PERCENT:-10}")
+    if [ "$as" = root ] || [ "$(id -u)" -ne 0 ]; then
+      exec env "${vars[@]}" python3 "$BACKUP_PY" "$@"
+    else
+      exec runuser -u "$as" -- env "${vars[@]}" python3 "$BACKUP_PY" "$@"
+    fi
+  )
+}
+
+backup_now() {
+  [ $# -eq 0 ] || die "--backup-now takes no options"
+  need_root
+  run_backup_py watcher backup
+}
+
+list_backups() {
+  [ $# -eq 0 ] || die "--list-backups takes no options"
+  if [ "$(id -u)" -eq 0 ]; then run_backup_py watcher list; else run_backup_py self list; fi
+}
+
+restore_backup() {
+  local NAME="" ONLY="" YES=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --only)   ONLY="${2:-}"; shift 2 ;;
+      --only=*) ONLY="${1#*=}"; shift ;;
+      --yes)    YES=1; shift ;;
+      -*)       die "unknown option for --restore: $1" ;;
+      *)        [ -z "$NAME" ] || die "--restore takes one backup name"; NAME="$1"; shift ;;
+    esac
+  done
+  need_root
+  [ -n "$NAME" ] || die "usage: watcher --restore NAME [--only config,events,dns] [--yes]   (see: watcher --list-backups)"
+  [[ "$NAME" =~ ^watcher-[0-9]{8}-[0-9]{6}$ ]] || die "invalid backup name: $NAME (see: watcher --list-backups)"
+  [ -z "$ONLY" ] || [[ "$ONLY" =~ ^(config|events|dns)(,(config|events|dns))*$ ]] || die "invalid --only: $ONLY"
+  have_systemd || die "systemd (systemctl) is required"
+
+  say "Restore backup $NAME${ONLY:+ (only: $ONLY)}"
+  say "  • the watcher service will be stopped during the restore"
+  say "  • current databases are moved to /var/lib/watcher/pre-restore-<time>/ (not deleted)"
+  if [ "$YES" -ne 1 ]; then
+    local answer
+    read -r -p "Type RESTORE to continue: " answer
+    [ "$answer" = "RESTORE" ] || { say "Cancelled — nothing changed."; return 1; }
+  fi
+  step "Stopping watcher"
+  systemctl stop watcher && ok "stopped"
+  local rc=0
+  run_backup_py root restore "$NAME" ${ONLY:+--only "$ONLY"} --yes || rc=$?
+  step "Starting watcher"
+  systemctl start watcher && ok "started"
+  if [ "$rc" -ne 0 ]; then
+    die "restore did not complete (see messages above); the service was restarted on the existing databases."
+  fi
+  say ""
+  say "Restore complete."
 }
 
 state_get() { [ -r "$STATE" ] && grep -E "^$1=" "$STATE" | tail -n1 | cut -d= -f2- || true; }
@@ -556,6 +637,9 @@ case "$CMD" in
   --setup-https)  setup_https "$@" ;;
   --remove-https) remove_https "$@" ;;
   --https-status) https_status ;;
+  --backup-now)   backup_now "$@" ;;
+  --list-backups) list_backups "$@" ;;
+  --restore)      restore_backup "$@" ;;
   -h|--help)      usage ;;
   "")             usage; exit 2 ;;
   *)              usage >&2; die "unknown command: $CMD" ;;

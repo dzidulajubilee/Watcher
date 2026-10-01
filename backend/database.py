@@ -15,7 +15,9 @@ import threading
 import time
 from datetime import datetime
 
-from config import RETAIN_DAYS
+from config      import RETAIN_DAYS
+from sqlite_util import RowCounter, delete_in_chunks, write_with_retry
+from timeparse   import to_epoch as _fast_to_epoch
 
 log = logging.getLogger("watcher.db")
 
@@ -29,7 +31,11 @@ class AlertDB:
         self.path        = str(path)
         self.retain_days = retain_days
         self._local      = threading.local()
+        # One writer at a time within this process (see sqlite_util.write_with_retry)
+        self._write_lock = threading.Lock()
         self._conn()
+        # O(1) row counts for /health and pagination (see sqlite_util.RowCounter)
+        self._counter    = RowCounter(self._conn, ("alerts", "flows", "http_events"))
         log.info("Events DB : %s  (retain %d days)", self.path, self.retain_days)
 
     # ── Connection / schema ───────────────────────────────────────────────────
@@ -116,42 +122,64 @@ class AlertDB:
     def _to_epoch(self, ts: str) -> float:
         """
         Parse a Suricata ISO-8601 timestamp to a Unix epoch float.
-
-        Uses module-level compiled regexes (not re-imported per call).
-        Falls back to 0.0 on any parse failure.
+        Fast exact parser (timeparse.py); unusual layouts fall back to the
+        original strptime path.  Falls back to 0.0 on any parse failure.
         """
-        if not ts:
-            return 0.0
-        normalised = _RE_USEC.sub(r"\1", ts)
-        normalised = _RE_TZ.sub(r"\1:\2", normalised)
-        for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
-            try:
-                return datetime.strptime(normalised, fmt).timestamp()
-            except ValueError:
-                pass
-        log.warning("_to_epoch: could not parse %r (normalised: %r)", ts, normalised)
-        return 0.0
+        return _fast_to_epoch(ts)
 
     # ── Alerts ────────────────────────────────────────────────────────────────
 
-    def insert(self, alert: dict):
-        try:
-            c = self._conn()
-            c.execute(
-                """INSERT OR IGNORE INTO alerts
+    _SQL_ALERT = """INSERT OR IGNORE INTO alerts
                    (id,ts,ts_epoch,src_ip,src_port,dst_ip,dst_port,
                     proto,iface,flow_id,sig_id,sig_msg,category,severity,action,raw_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (alert["id"], alert.get("ts", ""), self._to_epoch(alert.get("ts", "")),
-                 alert.get("src_ip", ""), alert.get("src_port", 0),
-                 alert.get("dst_ip", ""), alert.get("dst_port", 0),
-                 alert.get("proto", ""), alert.get("iface", ""), alert.get("flow_id", 0),
-                 alert.get("sig_id", 0), alert.get("sig_msg", ""), alert.get("category", ""),
-                 alert.get("severity", "info"), alert.get("action", "allowed"),
-                 json.dumps(alert.get("raw", {}))))
-            c.commit()
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+
+    def _alert_row(self, alert: dict) -> tuple:
+        return (alert["id"], alert.get("ts", ""), self._to_epoch(alert.get("ts", "")),
+                alert.get("src_ip", ""), alert.get("src_port", 0),
+                alert.get("dst_ip", ""), alert.get("dst_port", 0),
+                alert.get("proto", ""), alert.get("iface", ""), alert.get("flow_id", 0),
+                alert.get("sig_id", 0), alert.get("sig_msg", ""), alert.get("category", ""),
+                alert.get("severity", "info"), alert.get("action", "allowed"),
+                json.dumps(alert.get("raw", {})))
+
+    def insert(self, alert: dict):
+        try:
+            n = write_with_retry(self._conn(),
+                                 lambda c: c.execute(self._SQL_ALERT, self._alert_row(alert)).rowcount,
+                                 "alert insert", lock=self._write_lock)
+            self._counter.add("alerts", n)
         except sqlite3.Error as e:
             log.warning("DB insert (alert): %s", e)
+
+    def insert_batch(self, alerts=(), flows=(), http=()):
+        """
+        Insert many events in ONE transaction (group commit — used by the
+        live tail).  Waits for the lock instead of dropping data.  If the
+        batch fails for any other reason, falls back to row-by-row inserts so
+        one bad event cannot lose the rest of the batch.
+        """
+        if not (alerts or flows or http):
+            return
+        try:
+            rows_a = [self._alert_row(a) for a in alerts]
+            rows_f = [self._flow_row(f) for f in flows]
+            rows_h = [self._http_row(h) for h in http]
+
+            def work(c):
+                n = {}
+                if rows_a: n["alerts"]      = c.executemany(self._SQL_ALERT, rows_a).rowcount
+                if rows_f: n["flows"]       = c.executemany(self._SQL_FLOW,  rows_f).rowcount
+                if rows_h: n["http_events"] = c.executemany(self._SQL_HTTP,  rows_h).rowcount
+                return n
+            for table, n in write_with_retry(self._conn(), work, "event batch",
+                                             lock=self._write_lock).items():
+                self._counter.add(table, n)
+        except (sqlite3.Error, TypeError, ValueError) as e:
+            log.warning("DB batch insert failed (%s) — retrying row by row.", e)
+            for a in alerts: self.insert(a)
+            for f in flows:  self.insert_flow(f)
+            for h in http:   self.insert_http(h)
 
     def alert_exists(self, flow_id, ts: str, sig_id) -> bool:
         """
@@ -180,6 +208,8 @@ class AlertDB:
         # We pass it through from the handler to avoid a redundant COUNT(*) here.
         # For direct callers that don't pass total, fall back to a live count.
         total = kwargs.pop("_precomputed_total", None)
+        if total is None and (days or self.retain_days) >= self.retain_days:
+            total = self._counter.get("alerts")
         if total is None:
             total = conn.execute(
                 "SELECT COUNT(*) FROM alerts WHERE ts_epoch >= ?", (cutoff,)
@@ -221,9 +251,8 @@ class AlertDB:
         c = self._conn()
         counts = {}
         for tbl in ("alerts", "flows", "http_events"):
-            cur = c.execute(f"DELETE FROM {tbl}")
-            counts[tbl] = cur.rowcount
-        c.commit()
+            counts[tbl] = delete_in_chunks(c, tbl, lock=self._write_lock)          # short lock holds
+            self._counter.add(tbl, -counts[tbl])
         # Reset the stats cache so /health reflects the empty state immediately
         log.info("Flush all: %s", counts)
         return counts
@@ -297,7 +326,13 @@ class AlertDB:
 
     # ── Flows ─────────────────────────────────────────────────────────────────
 
-    def insert_flow(self, evt: dict):
+    _SQL_FLOW = """INSERT OR IGNORE INTO flows
+                   (flow_id,ts,ts_epoch,src_ip,src_port,dst_ip,dst_port,
+                    proto,app_proto,iface,pkts_toserver,pkts_toclient,
+                    bytes_toserver,bytes_toclient,duration_s,state,reason,alerted)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+
+    def _flow_row(self, evt: dict) -> tuple:
         f   = evt.get("flow", {})
         ts  = evt.get("timestamp", "")
         dur = 0.0
@@ -307,24 +342,22 @@ class AlertDB:
             dur = (t2 - t1).total_seconds()
         except Exception:
             pass
+        return (evt.get("flow_id", 0), ts, self._to_epoch(ts),
+                evt.get("src_ip", ""), evt.get("src_port", 0),
+                evt.get("dest_ip", ""), evt.get("dest_port", 0),
+                evt.get("proto", "").upper(), evt.get("app_proto", ""),
+                evt.get("in_iface", ""),
+                f.get("pkts_toserver", 0), f.get("pkts_toclient", 0),
+                f.get("bytes_toserver", 0), f.get("bytes_toclient", 0),
+                dur, f.get("state", ""), f.get("reason", ""),
+                1 if f.get("alerted") else 0)
+
+    def insert_flow(self, evt: dict):
         try:
-            c = self._conn()
-            c.execute(
-                """INSERT OR IGNORE INTO flows
-                   (flow_id,ts,ts_epoch,src_ip,src_port,dst_ip,dst_port,
-                    proto,app_proto,iface,pkts_toserver,pkts_toclient,
-                    bytes_toserver,bytes_toclient,duration_s,state,reason,alerted)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (evt.get("flow_id", 0), ts, self._to_epoch(ts),
-                 evt.get("src_ip", ""), evt.get("src_port", 0),
-                 evt.get("dest_ip", ""), evt.get("dest_port", 0),
-                 evt.get("proto", "").upper(), evt.get("app_proto", ""),
-                 evt.get("in_iface", ""),
-                 f.get("pkts_toserver", 0), f.get("pkts_toclient", 0),
-                 f.get("bytes_toserver", 0), f.get("bytes_toclient", 0),
-                 dur, f.get("state", ""), f.get("reason", ""),
-                 1 if f.get("alerted") else 0))
-            c.commit()
+            n = write_with_retry(self._conn(),
+                                 lambda c: c.execute(self._SQL_FLOW, self._flow_row(evt)).rowcount,
+                                 "flow insert", lock=self._write_lock)
+            self._counter.add("flows", n)
         except sqlite3.Error as e:
             log.warning("DB insert (flow): %s", e)
 
@@ -340,29 +373,33 @@ class AlertDB:
 
     # ── HTTP ──────────────────────────────────────────────────────────────────
 
-    def insert_http(self, evt: dict):
-        h   = evt.get("http", {})
-        ts  = evt.get("timestamp", "")
-        uid = f"{evt.get('flow_id',0)}-{evt.get('tx_id',0)}-http"
-        try:
-            c = self._conn()
-            c.execute(
-                """INSERT OR IGNORE INTO http_events
+    _SQL_HTTP = """INSERT OR IGNORE INTO http_events
                    (id,ts,ts_epoch,src_ip,src_port,dst_ip,dst_port,
                     iface,flow_id,hostname,url,method,status,
                     user_agent,content_type,req_bytes,resp_bytes,protocol)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (uid, ts, self._to_epoch(ts),
-                 evt.get("src_ip", ""), evt.get("src_port", 0),
-                 evt.get("dest_ip", ""), evt.get("dest_port", 0),
-                 evt.get("in_iface", ""), evt.get("flow_id", 0),
-                 h.get("hostname", ""), h.get("url", ""),
-                 h.get("http_method", ""), h.get("status", 0),
-                 h.get("http_user_agent", ""), h.get("http_content_type", ""),
-                 h.get("request_headers_raw_len", h.get("length", 0)),
-                 h.get("response_headers_raw_len", h.get("response_len", 0)),
-                 h.get("protocol", "")))
-            c.commit()
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+
+    def _http_row(self, evt: dict) -> tuple:
+        h   = evt.get("http", {})
+        ts  = evt.get("timestamp", "")
+        uid = f"{evt.get('flow_id',0)}-{evt.get('tx_id',0)}-http"
+        return (uid, ts, self._to_epoch(ts),
+                evt.get("src_ip", ""), evt.get("src_port", 0),
+                evt.get("dest_ip", ""), evt.get("dest_port", 0),
+                evt.get("in_iface", ""), evt.get("flow_id", 0),
+                h.get("hostname", ""), h.get("url", ""),
+                h.get("http_method", ""), h.get("status", 0),
+                h.get("http_user_agent", ""), h.get("http_content_type", ""),
+                h.get("request_headers_raw_len", h.get("length", 0)),
+                h.get("response_headers_raw_len", h.get("response_len", 0)),
+                h.get("protocol", ""))
+
+    def insert_http(self, evt: dict):
+        try:
+            n = write_with_retry(self._conn(),
+                                 lambda c: c.execute(self._SQL_HTTP, self._http_row(evt)).rowcount,
+                                 "http insert", lock=self._write_lock)
+            self._counter.add("http_events", n)
         except sqlite3.Error as e:
             log.warning("DB insert (http): %s", e)
 
@@ -468,9 +505,12 @@ class AlertDB:
         cutoff = time.time() - self.retain_days * 86400
         total  = 0
         c      = self._conn()
+        # Chunked (v1.9): a single DELETE of an hour of data held the write
+        # lock for seconds at high event rates, stalling ingest.
         for table in self._PURGEABLE_TABLES:
-            cur    = c.execute(self._PURGE_SQL[table], (cutoff,))
-            total += cur.rowcount
+            n      = delete_in_chunks(c, table, "ts_epoch < ?", (cutoff,), lock=self._write_lock)
+            self._counter.add(table, -n)
+            total += n
         # ack_history rows whose alert no longer exists (purged, cleared,
         # flushed) were previously kept forever.  Only orphans are removed —
         # history for alerts still in the database is untouched.
@@ -484,11 +524,10 @@ class AlertDB:
             log.info("Purged %d total rows older than %d days.", total, self.retain_days)
 
     def clear_all(self) -> int:
-        c   = self._conn()
-        cur = c.execute("DELETE FROM alerts")
-        c.commit()
-        log.info("Alerts cleared — %d rows deleted.", cur.rowcount)
-        return cur.rowcount
+        n = delete_in_chunks(self._conn(), "alerts", lock=self._write_lock)
+        self._counter.add("alerts", -n)
+        log.info("Alerts cleared — %d rows deleted.", n)
+        return n
 
     def delete_by_ids(self, ids: list) -> int:
         """
@@ -506,24 +545,20 @@ class AlertDB:
         # handler has already validated; the DB layer should never trust callers.
         ids = [str(i) for i in ids[:500]]
         placeholders = ",".join(["?"] * len(ids))
-        c   = self._conn()
-        # Remove ack history first (no FK cascade in SQLite by default)
-        c.execute(
-            f"DELETE FROM ack_history WHERE alert_id IN ({placeholders})", ids
-        )
-        cur = c.execute(
-            f"DELETE FROM alerts WHERE id IN ({placeholders})", ids
-        )
-        c.commit()
-        log.info("Deleted %d selected alerts.", cur.rowcount)
-        return cur.rowcount
+        def work(c):
+            # Remove ack history first (no FK cascade in SQLite by default)
+            c.execute(f"DELETE FROM ack_history WHERE alert_id IN ({placeholders})", ids)
+            return c.execute(f"DELETE FROM alerts WHERE id IN ({placeholders})", ids).rowcount
+        n = write_with_retry(self._conn(), work, "delete selected alerts", lock=self._write_lock)
+        self._counter.add("alerts", -n)
+        log.info("Deleted %d selected alerts.", n)
+        return n
 
     def clear_flows(self) -> int:
-        c   = self._conn()
-        cur = c.execute("DELETE FROM flows")
-        c.commit()
-        log.info("Flows cleared — %d rows deleted.", cur.rowcount)
-        return cur.rowcount
+        n = delete_in_chunks(self._conn(), "flows", lock=self._write_lock)
+        self._counter.add("flows", -n)
+        log.info("Flows cleared — %d rows deleted.", n)
+        return n
 
     # ── Chart data ────────────────────────────────────────────────────────────
 
@@ -608,29 +643,30 @@ class AlertDB:
     }
 
     def stats(self) -> dict:
-        c      = self._conn()
-        cutoff = time.time() - self.retain_days * 86400
-
-        def _cnt(t):    return c.execute(self._COUNT_SQL[t]).fetchone()[0]
-        def _recent(t): return c.execute(self._RECENT_SQL[t], (cutoff,)).fetchone()[0]
-
-        oldest = c.execute("SELECT MIN(ts) FROM alerts").fetchone()[0]
+        """
+        Counts come from incrementally maintained counters (O(1)) instead of
+        COUNT(*) over whole tables, whose cost grew linearly with table size
+        (~0.4 s per 10 M rows, re-run on every /health refresh).
+        'recent' and 'window' equal 'total': rows past the retention window
+        exist only until the next hourly purge.
+        """
+        c = self._conn()
+        a = self._counter.get("alerts")
+        f = self._counter.get("flows")
+        h = self._counter.get("http_events")
+        # Index-backed (idx_a_ts_sev) instead of MIN(ts), which scanned the table
+        oldest_row = c.execute(
+            "SELECT ts FROM alerts ORDER BY ts_epoch ASC LIMIT 1"
+        ).fetchone()
         # Most recently seen interface from eve.json (in_iface field)
         iface_row = c.execute(
             "SELECT iface FROM alerts WHERE iface != '' ORDER BY ts_epoch DESC LIMIT 1"
         ).fetchone()
-        # Total alert count within retention window — cached here so
-        # fetch_recent() doesn't re-run COUNT(*) on every paginated request
-        cutoff_alerts = time.time() - self.retain_days * 86400
-        alerts_total  = c.execute(
-            "SELECT COUNT(*) FROM alerts WHERE ts_epoch >= ?", (cutoff_alerts,)
-        ).fetchone()[0]
         return {
-            "alerts": {"total": _cnt("alerts"),     "recent": _recent("alerts"),
-                       "window": alerts_total},
-            "flows":  {"total": _cnt("flows"),       "recent": _recent("flows")},
-            "http":   {"total": _cnt("http_events"), "recent": _recent("http_events")},
-            "oldest": oldest,
+            "alerts": {"total": a, "recent": a, "window": a},
+            "flows":  {"total": f, "recent": f},
+            "http":   {"total": h, "recent": h},
+            "oldest": oldest_row[0] if oldest_row else None,
             "iface":  iface_row[0] if iface_row else None,
         }
 

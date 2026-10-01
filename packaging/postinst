@@ -32,10 +32,15 @@ case "$1" in
 
     chown root:watcher /etc/watcher
     chmod 750 /etc/watcher
-    if [ -f /etc/watcher/watcher.conf ]; then
-      chown root:watcher /etc/watcher/watcher.conf
-      chmod 640 /etc/watcher/watcher.conf
-    fi
+    for f in /etc/watcher/watcher.conf /etc/watcher/backup.conf; do
+      if [ -f "$f" ]; then
+        chown root:watcher "$f"
+        chmod 640 "$f"
+      fi
+    done
+
+    # ── Backup directory (kept on purge — it holds your backups) ─────────────
+    install -d -m 750 -o watcher -g watcher /var/backups/watcher
 
     # ── Bootstrap admin credentials (first install only) ─────────────────────
     CONFIG_DB="/var/lib/watcher/config.db"
@@ -93,6 +98,9 @@ PYEOF
     # ── Systemd ───────────────────────────────────────────────────────────────
     systemctl daemon-reload 2>/dev/null || true
     systemctl enable watcher.service   2>/dev/null || true
+    # Daily database backups (settings: /etc/watcher/backup.conf)
+    systemctl enable watcher-backup.timer 2>/dev/null || true
+    systemctl start  watcher-backup.timer 2>/dev/null || true
 
     if systemctl is-active --quiet watcher.service 2>/dev/null; then
       systemctl restart watcher.service
@@ -103,7 +111,7 @@ PYEOF
     # ── Install banner ────────────────────────────────────────────────────────
     echo ""
     echo "┌─────────────────────────────────────────────────────────┐"
-    echo "│  Watcher IDS v1.8.0 installed successfully              │"
+    echo "│  Watcher IDS v1.10.0 installed successfully             │"
     echo "│                                                         │"
     if [ -f /etc/systemd/system/watcher.service.d/https.conf ]; then
     echo "│  Dashboard  →  https://<this-host>/  (nginx, HTTPS)     │"
@@ -114,6 +122,7 @@ PYEOF
     echo "│  Logs       →  journalctl -u watcher -f                 │"
     echo "│  Status     →  systemctl status watcher                 │"
     echo "│  Config     →  /etc/watcher/watcher.conf                │"
+    echo "│  Backups    →  daily, /var/backups/watcher              │"
     echo "│                                                         │"
 
     if [ -n "$ADMIN_PW" ]; then
@@ -126,7 +135,21 @@ PYEOF
     fi
 
     echo "│                                                         │"
-    echo "│  What's new in v1.8.0:                                  │"
+    echo "│  What's new in v1.10.0:                                 │"
+    echo "│    • Daily database backups (systemd timer), with       │"
+    echo "│      free-space guard; watcher --backup-now,            │"
+    echo "│      --list-backups, --restore NAME                     │"
+    echo "│    • Live view: flows/DNS sent once per second          │"
+    echo "│      (alerts unchanged) — browsers keep up at any rate  │"
+    echo "│                                                         │"
+    echo "│  v1.9.0:                                                │"
+    echo "│    • Ingest ~4-5x faster: group commit, fast            │"
+    echo "│      timestamp parsing, no per-line tell()              │"
+    echo "│    • Fix: events split across writes no longer lost     │"
+    echo "│    • Fix: purge/flush no longer stall or drop ingest    │"
+    echo "│    • /health counts are O(1) at any database size       │"
+    echo "│                                                         │"
+    echo "│  v1.8.0:                                                │"
     echo "│    • HTTPS: sudo watcher --setup-https (nginx +         │"
     echo "│      self-signed cert; backend bound to 127.0.0.1)      │"
     echo "│    • Security: no auto-generated fallback password;     │"

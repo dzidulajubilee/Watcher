@@ -498,5 +498,343 @@ class TestProxyAwareness(WatcherTestCase):
             if old is not None: os.environ["WATCHER_HOST"] = old
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Performance phase 1 — ingest correctness under load
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_tail(eve_path, db, registry, **kw):
+    import tail
+    if "explain_engine" in tail.tail_thread.__code__.co_varnames:
+        kw.setdefault("explain_engine", None)
+    threading.Thread(target=tail.tail_thread, args=(str(eve_path), db, registry),
+                     kwargs=kw, daemon=True).start()
+    time.sleep(0.4)
+
+
+def _wait_for(fn, expected, timeout=10):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if fn() == expected:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+class TestTailCompleteLines(WatcherTestCase):
+    def test_line_split_across_writes_is_not_lost(self):
+        Handler.eve_path.write_text("")
+        _run_tail(Handler.eve_path, self.db, self.registry, dns_db=self.dns_db)
+        with open(Handler.eve_path, "a") as f:
+            for i in range(10):
+                line = eve_alert_line(i)
+                f.write(line[:len(line) // 2]); f.flush(); time.sleep(0.15)
+                f.write(line[len(line) // 2:] + "\n"); f.flush()
+        count = lambda: self.db._conn().execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+        self.assertTrue(_wait_for(count, 10), f"stored {count()} of 10 split lines")
+
+    def test_alerts_broadcast_only_after_commit(self):
+        Handler.eve_path.write_text("")
+        seen = []
+        orig = self.registry.broadcast
+        def spy(event_type, payload):
+            if event_type == "alert":
+                n = self.db._conn().execute(
+                    "SELECT COUNT(*) FROM alerts WHERE id = ?", (payload["id"],)).fetchone()[0]
+                seen.append(n)
+            return orig(event_type, payload)
+        self.registry.broadcast = spy
+        _run_tail(Handler.eve_path, self.db, self.registry, dns_db=self.dns_db)
+        with open(Handler.eve_path, "a") as f:
+            f.write("\n".join(eve_alert_line(i) for i in range(50)) + "\n")
+        self.assertTrue(_wait_for(lambda: len(seen), 50))
+        self.assertEqual(set(seen), {1}, "an alert was broadcast before it was stored")
+
+    def test_quiet_sensor_has_no_batching_delay(self):
+        Handler.eve_path.write_text("")
+        _run_tail(Handler.eve_path, self.db, self.registry, dns_db=self.dns_db)
+        with open(Handler.eve_path, "a") as f:
+            f.write(eve_alert_line(1) + "\n")
+        start = time.time()
+        count = lambda: self.db._conn().execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+        self.assertTrue(_wait_for(count, 1))
+        self.assertLess(time.time() - start, 0.5)
+
+
+class TestFastTimestamps(unittest.TestCase):
+    def test_bit_identical_to_original_parser(self):
+        import random
+        from timeparse import to_epoch, _slow_epoch
+        rnd = random.Random(11)
+        cases = ["", "junk", "2026-09-30T12:00:00+0000", "2026-09-30T12:00:00.5-0530",
+                 "2024-02-29T23:59:59.999999+1400", "2026-02-29T00:00:00+0000",
+                 "2026-09-30T24:00:00+0000", "2026-09-30T12:60:00+0000",
+                 "2026-09-30T12:00:00Z", "２０２６-09-30T12:00:00+0000"]
+        for _ in range(20000):
+            cases.append(f"{rnd.randint(1971,2099):04d}-{rnd.randint(1,12):02d}-{rnd.randint(1,31):02d}"
+                         f"T{rnd.randint(0,23):02d}:{rnd.randint(0,59):02d}:{rnd.randint(0,59):02d}"
+                         f"{rnd.choice(['', '.7', '.123', '.123456'])}{rnd.choice('+-')}"
+                         f"{rnd.randint(0,14):02d}{rnd.choice([0,30,45]):02d}")
+        for c in cases:
+            self.assertEqual(to_epoch(c), _slow_epoch(c), c)
+
+
+class TestLockRetryNoDrop(WatcherTestCase):
+    def test_insert_waits_for_external_writer_instead_of_dropping(self):
+        import sqlite3, tail
+        other = sqlite3.connect(self.db.path, timeout=1, check_same_thread=False)
+        other.execute("BEGIN IMMEDIATE")          # another process holds the write lock
+        release = threading.Timer(6.0, other.commit)   # longer than the 5 s busy timeout
+        release.start()
+        _, alert = tail.parse_eve_line(eve_alert_line(1))
+        self.db.insert(alert)                      # previously: logged and dropped
+        other.close()
+        n = self.db._conn().execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+        self.assertEqual(n, 1)
+
+
+class TestChunkedMaintenanceAndCounters(WatcherTestCase):
+    def _true_counts(self):
+        c = self.db._conn()
+        return {t: c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                for t in ("alerts", "flows", "http_events")}
+
+    def _counted(self):
+        s = self.db.stats()
+        return {"alerts": s["alerts"]["total"], "flows": s["flows"]["total"],
+                "http_events": s["http"]["total"]}
+
+    def test_counters_match_reality_through_all_write_paths(self):
+        import tail
+        self.db.stats()                                     # initialise counters
+        lines = [eve_alert_line(i) for i in range(30)]
+        for l in lines:
+            self.db.insert(tail.parse_eve_line(l)[1])
+        flows = [json.loads(l) | {"event_type": "flow", "flow": {"state": "closed"}} for l in lines]
+        self.db.insert_batch(flows=flows)
+        self.db.insert_batch(flows=flows)                   # duplicates: ignored, not counted
+        self.assertEqual(self._counted(), self._true_counts())
+        ids = [r[0] for r in self.db._conn().execute("SELECT id FROM alerts LIMIT 5")]
+        self.db.delete_by_ids(ids)
+        self.assertEqual(self._counted(), self._true_counts())
+        c = self.db._conn()
+        c.execute("UPDATE flows SET ts_epoch = 1 WHERE flow_id < 1015"); c.commit()
+        self.db.purge_old()
+        self.assertEqual(self._counted(), self._true_counts())
+        self.db.clear_flows(); self.db.clear_all()
+        self.assertEqual(self._counted(), self._true_counts())
+
+    def test_chunked_purge_removes_all_expired_rows(self):
+        import sqlite3
+        c = sqlite3.connect(self.db.path)
+        c.execute("""WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i < 12345)
+                     INSERT INTO flows (flow_id, ts, ts_epoch) SELECT i, 'x', 1 FROM s""")
+        c.execute("INSERT INTO flows (flow_id, ts, ts_epoch) VALUES (999999, 'x', ?)", (time.time(),))
+        c.commit(); c.close()
+        self.db.purge_old()
+        left = self.db._conn().execute("SELECT flow_id FROM flows").fetchall()
+        self.assertEqual([r[0] for r in left], [999999])
+
+    def test_dns_counts_and_fetch_total(self):
+        base = {"timestamp": "2026-09-30T12:00:00.000001+0000", "event_type": "dns",
+                "src_ip": "10.0.0.1", "dest_ip": "10.0.0.2"}
+        evts = [dict(base, flow_id=i, dns={"type": "query", "rrname": f"h{i}.x", "tx_id": 0})
+                for i in range(40)]
+        self.dns_db.insert_batch(evts)
+        self.assertEqual(self.dns_db.count(), 40)
+        self.assertEqual(self.dns_db.fetch(limit=5)["total"], 40)
+        self.dns_db.clear()
+        self.assertEqual(self.dns_db.count(), 0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v1.10 — live view batching
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestLiveBatching(WatcherTestCase):
+    def test_flows_batched_alerts_individual(self):
+        import tail
+        Handler.eve_path.write_text("")
+        got = []
+        orig = self.registry.broadcast
+        def spy(event_type, payload):
+            got.append((time.monotonic(), event_type, payload))
+            return orig(event_type, payload)
+        self.registry.broadcast = spy
+        _run_tail(Handler.eve_path, self.db, self.registry, dns_db=self.dns_db)
+        base = {"timestamp": "2026-09-30T12:00:00.000001+0000", "src_ip": "10.0.0.1",
+                "dest_ip": "10.0.0.2", "proto": "TCP"}
+        lines = [json.dumps(dict(base, event_type="flow", flow_id=5000 + i, flow={})) for i in range(900)]
+        lines += [eve_alert_line(i) for i in range(7)]
+        with open(Handler.eve_path, "a") as f:
+            f.write("\n".join(lines) + "\n")
+        count = lambda: self.db._conn().execute("SELECT COUNT(*) FROM flows").fetchone()[0]
+        self.assertTrue(_wait_for(count, 900))
+        time.sleep(tail.LIVE_BATCH_INTERVAL + 0.6)            # idle emit happens
+        kinds = [k for _, k, _ in got]
+        self.assertNotIn("flow", kinds)                       # no per-event flow messages
+        self.assertEqual(kinds.count("alert"), 7)             # alerts unchanged
+        batches = [(ts, p) for ts, k, p in got if k == "flow_batch"]
+        self.assertGreaterEqual(len(batches), 1)
+        self.assertEqual(sum(p["count"] for _, p in batches), 900)   # nothing uncounted
+        self.assertTrue(all(len(p["items"]) <= tail.LIVE_BATCH_MAX for _, p in batches))
+        self.assertEqual(batches[-1][1]["items"][-1]["flow_id"], 5899)  # newest last
+        gaps = [b[0] - a[0] for a, b in zip(batches, batches[1:])]
+        self.assertTrue(all(g >= tail.LIVE_BATCH_INTERVAL * 0.9 for g in gaps))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v1.10 — database backups (backend/backup.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBackups(WatcherTestCase):
+    def setUp(self):
+        super().setUp()
+        import backup, sqlite3
+        self.backup = backup
+        self.bdir = pathlib.Path(tempfile.mkdtemp(prefix="watcher-bk-"))
+        self._env = {k: os.environ.get(k) for k in
+                     ("BACKUP_DIR", "BACKUP_KEEP", "BACKUP_MIN_FREE_PERCENT", "BACKUP_DATABASES")}
+        os.environ.update(BACKUP_DIR=str(self.bdir), BACKUP_KEEP="2", BACKUP_MIN_FREE_PERCENT="0",
+                          BACKUP_DATABASES="config events dns")
+        self._data = backup.DATA_DIR
+        backup.DATA_DIR = pathlib.Path(self.tmp)          # events.db / dns.db / config.db
+        c = sqlite3.connect(f"{self.tmp}/events.db")
+        c.execute("""WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i < 50000)
+                     INSERT INTO flows (flow_id, ts, ts_epoch) SELECT i, 'x', 1 FROM s""")
+        c.commit(); c.close()
+
+    def tearDown(self):
+        self.backup.DATA_DIR = self._data
+        for k, v in self._env.items():
+            if v is None: os.environ.pop(k, None)
+            else: os.environ[k] = v
+        import shutil; shutil.rmtree(self.bdir, ignore_errors=True)
+        super().tearDown()
+
+    def _run(self, *args):
+        import io, contextlib
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.backup.main(list(args))
+        return rc, out.getvalue()
+
+    def _backups(self):
+        return [p for p, _ in self.backup.complete_backups(self.bdir)]
+
+    def test_backup_during_ingest_is_consistent_and_verified(self):
+        import sqlite3, tail
+        stop = [False]
+        def writer():
+            i = 0
+            while not stop[0]:
+                self.db.insert_batch(flows=[json.loads(eve_alert_line(0)) | {"event_type": "flow",
+                                     "flow_id": 10_000_000 + i + k, "flow": {}} for k in range(200)])
+                i += 200
+        th = threading.Thread(target=writer); th.start()
+        try:
+            rc, out = self._run("backup")
+        finally:
+            stop[0] = True; th.join()
+        self.assertEqual(rc, 0, out)
+        (b,) = self._backups()
+        man = json.loads((b / "manifest.json").read_text())
+        self.assertEqual(man["status"], "complete")
+        self.assertEqual(set(man["databases"]), {"config", "events", "dns"})
+        c = sqlite3.connect(b / "events.db")
+        self.assertEqual(c.execute("PRAGMA quick_check").fetchone()[0], "ok")
+        self.assertGreaterEqual(c.execute("SELECT COUNT(*) FROM flows").fetchone()[0], 50000)
+        c = sqlite3.connect(b / "config.db")
+        self.assertEqual(c.execute("SELECT username FROM users").fetchone()[0], "admin")
+
+    def test_rotation_keeps_newest_and_ignores_partial(self):
+        (self.bdir / ".partial-watcher-20200101-000000").mkdir(parents=True)
+        for _ in range(3):
+            self.assertEqual(self._run("backup")[0], 0)
+            time.sleep(1.05)
+        names = [p.name for p in self._backups()]
+        self.assertEqual(len(names), 2)
+        self.assertEqual(names, sorted(names, reverse=True))
+        rc, out = self._run("list")
+        self.assertNotIn("partial-watcher", out)
+
+    def test_free_space_guard_skips_large_db_but_keeps_config(self):
+        import collections
+        real = os.statvfs
+        size_cfg = pathlib.Path(self.tmp, "config.db").stat().st_size
+        FakeVfs = collections.namedtuple("FakeVfs", "f_bavail f_frsize f_blocks")
+        # enough free space for config.db (+ the guard's 5 % + 16 MB headroom)
+        # but not for events.db, which is much larger than 512 KB
+        free = int(size_cfg * 1.05) + 16 * 1024 * 1024 + 512 * 1024
+        self.backup.os.statvfs = lambda p: FakeVfs(free, 1, 10 ** 12)
+        try:
+            rc, out = self._run("backup")
+        finally:
+            self.backup.os.statvfs = real
+        self.assertEqual(rc, 1)
+        (b,) = self._backups()
+        man = json.loads((b / "manifest.json").read_text())
+        self.assertEqual(man["status"], "partial")
+        self.assertIn("config", man["databases"])
+        self.assertIn("events", man["skipped"])
+        self.assertIn("not enough space", man["skipped"]["events"])
+
+    def test_config_backed_up_even_when_disk_below_floor(self):
+        import collections
+        real = os.statvfs
+        FakeVfs = collections.namedtuple("FakeVfs", "f_bavail f_frsize f_blocks")
+        # 9.7 GB free of 252 GB: below a 10 % floor (the sandbox's real situation)
+        os.environ["BACKUP_MIN_FREE_PERCENT"] = "10"
+        self.backup.os.statvfs = lambda p: FakeVfs(9_700_000_000, 1, 252_000_000_000)
+        try:
+            rc, out = self._run("backup")
+        finally:
+            self.backup.os.statvfs = real
+        (b,) = self._backups()
+        man = json.loads((b / "manifest.json").read_text())
+        self.assertEqual(list(man["databases"]), ["config"])
+        self.assertEqual(set(man["skipped"]), {"events", "dns"})
+        self.assertEqual(rc, 1)                     # partial backup is reported as not OK
+
+    def test_restore_full_and_config_only_keeps_previous_files(self):
+        import sqlite3
+        self.assertEqual(self._run("backup")[0], 0)
+        (b,) = self._backups()
+        # change data after the backup
+        self.um.create("mallory", "pw-123456789", role="admin")
+        c = sqlite3.connect(f"{self.tmp}/events.db"); c.execute("DELETE FROM flows"); c.commit(); c.close()
+        self.tearDown_server_only()
+        rc, out = self._run("restore", b.name, "--only", "config", "--yes")
+        self.assertEqual(rc, 0, out)
+        users = [r[0] for r in sqlite3.connect(f"{self.tmp}/config.db").execute("SELECT username FROM users")]
+        self.assertEqual(users, ["admin"])                       # config restored
+        n = sqlite3.connect(f"{self.tmp}/events.db").execute("SELECT COUNT(*) FROM flows").fetchone()[0]
+        self.assertEqual(n, 0)                                   # events untouched
+        rc, out = self._run("restore", b.name, "--yes")
+        n = sqlite3.connect(f"{self.tmp}/events.db").execute("SELECT COUNT(*) FROM flows").fetchone()[0]
+        self.assertEqual(n, 50000)                               # events restored
+        aside = sorted(pathlib.Path(self.tmp).glob("pre-restore-*"))
+        self.assertTrue(aside and (aside[0] / "config.db").exists())
+
+    def tearDown_server_only(self):
+        self.srv.shutdown()
+
+    def test_rejects_backup_dir_inside_data_dir(self):
+        os.environ["BACKUP_DIR"] = str(pathlib.Path(self.tmp) / "backups")
+        with self.assertRaises(SystemExit):
+            self._run("backup")
+
+    def test_concurrent_run_exits_cleanly(self):
+        import fcntl
+        self.bdir.mkdir(exist_ok=True)
+        fd = os.open(str(self.bdir / ".lock"), os.O_CREAT | os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            rc, out = self._run("backup")
+        finally:
+            os.close(fd)
+        self.assertEqual(rc, 2)
+        self.assertEqual(self._backups(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

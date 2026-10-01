@@ -22,6 +22,10 @@ case "$1" in
     rmdir /etc/systemd/system/watcher.service.d 2>/dev/null || true
 
     rm -rf /var/lib/watcher /etc/watcher
+    # Backups are deliberately KEPT — they may be the only copy of your data.
+    if [ -d /var/backups/watcher ]; then
+      echo "Watcher IDS backups were kept in /var/backups/watcher (remove manually if not needed)."
+    fi
     deluser  --system watcher  2>/dev/null || true
     delgroup --system watcher  2>/dev/null || true
     systemctl daemon-reload    2>/dev/null || true

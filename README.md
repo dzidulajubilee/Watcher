@@ -140,7 +140,7 @@ Browser ◄──► Python HTTP server  (handlers.py — ThreadedHTTPServer)
 ### Dual build
 
 ```
-./build-deb.sh 1.8.0
+./build-deb.sh 1.10.0
        │
        ├── Step 1: npm run build (frontend-src → frontend/)
        │
@@ -148,9 +148,9 @@ Browser ◄──► Python HTTP server  (handlers.py — ThreadedHTTPServer)
        │              removes: explain.py, LLM routes, AI settings panel
        │              keeps:   Explain button, Threat Intel tab, all data views
        │
-       ├── Step 3: watcher-ids_1.8.0_all.deb        (full — AI Explain included)
-       ├── Step 4: watcher-ids_1.8.0-noai_all.deb   (AI-free — smaller footprint)
-       └── Step 5: watcher-ids-src_1.8.0.zip        (source archive)
+       ├── Step 3: watcher-ids_1.10.0_all.deb        (full — AI Explain included)
+       ├── Step 4: watcher-ids_1.10.0-noai_all.deb   (AI-free — smaller footprint)
+       └── Step 5: watcher-ids-src_1.10.0.zip        (source archive)
 ```
 
 **No Node.js on the server.** The frontend is compiled once at build time and shipped as plain JS/CSS. The Python server serves static files only.
@@ -176,6 +176,9 @@ watcher-ids/
 │   ├── suppression.py        Suppression rules — in-memory cached engine (30 s TTL)
 │   ├── registry.py           SSE client fan-out
 │   ├── password_utils.py     PBKDF2-SHA256 hashing
+│   ├── backup.py             Database backups: backup / list / restore
+│   ├── sqlite_util.py        Lock-retry writes, chunked deletes, O(1) row counters
+│   ├── timeparse.py          Fast exact Suricata timestamp parser
 │   ├── migrate.py            One-time DB migration tool
 │   └── config.py             Runtime constants and default paths
 │
@@ -205,6 +208,8 @@ watcher-ids/
 │   ├── prerm                 Runs before remove: stop service
 │   ├── postrm                Runs after purge: clean up data dirs + Watcher-created nginx/systemd files
 │   ├── watcher-cli           /usr/bin/watcher admin command (--setup-https etc.)
+│   ├── watcher-backup.*      systemd timer + service for daily backups
+│   ├── backup.conf           Backup settings (/etc/watcher/backup.conf)
 │   ├── watcher.service       systemd unit with security hardening
 │   └── watcher.conf          Default config file (/etc/watcher/watcher.conf)
 │
@@ -226,7 +231,7 @@ watcher-ids/
 Download the latest `.deb` from the [Releases](../../releases) page:
 
 ```bash
-sudo apt install ./watcher-ids_1.8.0_all.deb
+sudo apt install ./watcher-ids_1.10.0_all.deb
 ```
 
 That's it. The installer:
@@ -253,17 +258,17 @@ To serve it over HTTPS instead (recommended on shared networks), run `sudo watch
 ```bash
 git clone https://github.com/yourname/watcher-ids.git
 cd watcher-ids
-./build-deb.sh 1.8.0
-sudo apt install ./packaging/build/watcher-ids_1.8.0_all.deb
+./build-deb.sh 1.10.0
+sudo apt install ./packaging/build/watcher-ids_1.10.0_all.deb
 ```
 
 The build script compiles the frontend with Vite, strips the AI engine for the noai variant, assembles both package trees, and calls `dpkg-deb`. Three artifacts are produced per run:
 
 | Artifact | Description |
 |---|---|
-| `watcher-ids_1.8.0_all.deb` | Full build — includes AI Explain (DeepSeek / OpenAI / Claude / NVIDIA) |
-| `watcher-ids_1.8.0-noai_all.deb` | AI-free build — LLM engine removed, Threat Intel and Explain button kept |
-| `watcher-ids-src_1.8.0.zip` | Source archive for distribution |
+| `watcher-ids_1.10.0_all.deb` | Full build — includes AI Explain (DeepSeek / OpenAI / Claude / NVIDIA) |
+| `watcher-ids_1.10.0-noai_all.deb` | AI-free build — LLM engine removed, Threat Intel and Explain button kept |
+| `watcher-ids-src_1.10.0.zip` | Source archive for distribution |
 
 ---
 
@@ -347,6 +352,32 @@ To use a certificate from your own CA instead, replace `/etc/watcher/tls/watcher
 
 ---
 
+## Backups
+
+A systemd timer backs up the databases **daily at about 02:30** to `/var/backups/watcher/` (settings: `/etc/watcher/backup.conf`).
+
+```bash
+sudo watcher --backup-now                    # back up now
+watcher --list-backups                       # list (newest first)
+sudo watcher --restore watcher-20261001-023112                 # everything
+sudo watcher --restore watcher-20261001-023112 --only config   # users, webhooks, threat intel, rules only
+```
+
+- **Consistent while Watcher runs.** Each database is copied in one SQLite read transaction (online backup API), so ingest keeps writing and the copy is a consistent snapshot. Every copy is checked with `PRAGMA quick_check`.
+- **`config.db` first.** It is small and holds what is hardest to recreate (users, webhooks, threat intel, suppression rules, settings).
+- **Free-space guard.** A database whose copy would leave less than `BACKUP_MIN_FREE_PERCENT` (default 10 %) of the disk free is **skipped and reported** — the others are still backed up. `config.db` is exempt while its copy is at most a tenth of the free space, so the most valuable data is still saved on a nearly full disk. The backup never fills the disk Suricata and Watcher write to.
+- **Atomic and rotated.** A backup is written to a `.partial-…` folder and renamed only when every copy has succeeded and verified. The newest `BACKUP_KEEP` (default 2) complete backups are kept; the oldest is removed only after a new one succeeds, so peak use is `(BACKUP_KEEP + 1) × database size`.
+- **Restore is non-destructive.** `--restore` stops the service, verifies the backup, moves the current files to `/var/lib/watcher/pre-restore-<time>/`, restores, and starts the service again.
+- **Kept on purge.** `apt purge watcher-ids` does not delete `/var/backups/watcher`.
+
+**Sizing.** Backups need as much space as the databases. With the default 90-day retention, a sensor at 5,000 events/s can reach ~8 TB of data; if the disk cannot hold the copies, set `BACKUP_DATABASES="config"` (or add storage) — the guard will otherwise skip the large databases every night and log why.
+
+**Same disk ≠ off-site.** Local backups protect against corruption, mistakes and bad upgrades, not against losing the disk or server. Copy the newest backup elsewhere regularly, e.g. `rsync -a /var/backups/watcher/ backup-host:/srv/watcher/`.
+
+Check the last run: `journalctl -u watcher-backup -n 30`. Change the schedule: `sudo systemctl edit watcher-backup.timer`. Disable: `sudo systemctl disable --now watcher-backup.timer`.
+
+---
+
 ## RBAC — Roles
 
 | Permission | Admin | Analyst | Viewer |
@@ -422,10 +453,14 @@ Test any webhook from the Settings panel without waiting for a real alert.
 ## Upgrading
 
 ```bash
-sudo apt install ./watcher-ids_1.8.0_all.deb
+sudo apt install ./watcher-ids_1.10.0_all.deb
 ```
 
 dpkg stops the running service, replaces files, restarts. Databases survive untouched. `/etc/watcher/watcher.conf` is preserved as a dpkg conffile. An HTTPS setup (`watcher --setup-https`) survives upgrades.
+
+**Upgrading to 1.10.0:** daily backups are enabled automatically (see [Backups](#backups)); the first one runs at the next ~02:30. Check free space before then, or run `sudo watcher --backup-now` to see what fits. The live Flows/DNS views update once per second instead of per event.
+
+**Upgrading to 1.9.0:** no schema changes. On the first start the event counts shown by `/health` are computed once (a full count, as every `/health` request did before); afterwards they are maintained incrementally. The hourly purge now deletes in small chunks — it takes longer in total but no longer blocks ingest.
 
 **Upgrading to 1.8.0:** the first start adds one index to `events.db` (`idx_a_flow_ts`), which can take a little while on a large database. The old auto-generated fallback password stops working — see [Emergency fallback password](#emergency-fallback-password-break-glass).
 
@@ -479,8 +514,8 @@ python3 -m unittest discover -s tests -v
 Pushing a tag triggers an automatic build and GitHub Release:
 
 ```bash
-git tag v1.8.0
-git push origin v1.8.0
+git tag v1.10.0
+git push origin v1.10.0
 ```
 
 The workflow installs Node, builds the frontend, assembles both `.deb` variants (full + noai), and attaches them to the release. No secrets needed — only the default `GITHUB_TOKEN`.
@@ -507,6 +542,26 @@ AGPL-3.0 — see [LICENSE](LICENSE).
 ---
 
 ## Changelog
+
+### v1.10.0 — 2026-09-30
+
+#### New
+- **Database backups** — daily systemd timer (`watcher-backup.timer`), `sudo watcher --backup-now`, `watcher --list-backups`, `sudo watcher --restore NAME [--only config,events,dns]`. Consistent online copies (one-step SQLite backup API — a stepwise backup restarted 113 times in 12 s under live ingest and would never finish), `quick_check` verification, per-database free-space guard, atomic completion, rotation after success, non-destructive restore. Settings in `/etc/watcher/backup.conf`. Backups are kept on purge.
+
+#### Performance
+- **Live view batching** — flows, DNS and HTTP events are sent to browsers once per second (the most recent 200 of each plus the true count) instead of one message per event; alerts are still sent individually and immediately. A 50,000-event burst: 38,036 → 1,446 messages per dashboard (12.0 → 1.6 MB). All events are still stored.
+
+### v1.9.0 — 2026-09-30
+
+#### Performance (measured on one CPU core, realistic event mix)
+- **Ingest throughput ≈4.8× higher** — ~9,200 → ~42,000–47,000 events/s. Events are group-committed (up to 500 events or 100 ms per transaction, and immediately whenever the reader has caught up, so a quiet sensor sees no added latency); timestamps are parsed by a fast exact parser (6× faster, bit-identical results); the tail no longer calls `tell()` per line. Stored data is identical to v1.8.0 (verified row-by-row).
+- **`/health` counts are O(1)** — previously `COUNT(*)` over whole tables on every refresh (~0.4 s per 10 M rows). DNS pagination no longer counts the whole DNS table on every page.
+
+#### Correctness
+- **Events split across writes are no longer lost** — a line Suricata had only half-written was parsed, failed, and skipped (both halves lost). Only complete lines are processed now.
+- **The hourly purge no longer stalls ingest or drops events** — a single large `DELETE` held the write lock for seconds; an insert that waited more than 5 s was logged and dropped. Purge, Flush and Clear now delete in small chunks, writers in the process take turns via a shared lock, and a write that meets a locked database waits and retries instead of dropping data. Measured with 6 M expired rows: longest ingest stall 5.0 s → 0.12 s, events dropped 1 → 0.
+- Dashboards and webhooks are notified only after the events are committed.
+- A missing DNS database no longer crashes the tail thread (latent: `AlertDB.insert_dns` did not exist).
 
 ### v1.8.0 — 2026-09-30
 

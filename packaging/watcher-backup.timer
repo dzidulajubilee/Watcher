@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Watcher IDS database backup
+
+[Timer]
+# Change the schedule with: sudo systemctl edit watcher-backup.timer
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,32 @@
+[Unit]
+Description=Watcher IDS database backup
+# Runs /opt/watcher/backup.py as the watcher user; scheduled by watcher-backup.timer.
+# Settings: /etc/watcher/backup.conf.  Run now: sudo watcher --backup-now
+
+[Service]
+Type=oneshot
+User=watcher
+Group=watcher
+EnvironmentFile=-/etc/watcher/backup.conf
+ExecStart=/usr/bin/python3 /opt/watcher/backup.py backup
+# Stay out of the way of live ingest
+Nice=10
+IOSchedulingClass=idle
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=watcher-backup
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# /var/lib/watcher must be writable for SQLite's WAL shared-memory file even
+# when only reading.  If you change BACKUP_DIR, add it here with:
+#   sudo systemctl edit watcher-backup.service   →  ReadWritePaths=<dir>
+ReadWritePaths=/var/lib/watcher /var/backups/watcher
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true

@@ -22,6 +22,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from sqlite_util import RowCounter, delete_in_chunks, write_with_retry
+from timeparse   import to_epoch as _fast_to_epoch
+
 log = logging.getLogger("watcher.dns_db")
 
 _RE_USEC = _re.compile(r"(\.\d{3})\d+")
@@ -33,7 +36,10 @@ class DnsDB:
         self.path        = str(path)
         self.retain_days = retain_days
         self._local      = threading.local()
+        # One writer at a time within this process (see sqlite_util.write_with_retry)
+        self._write_lock = threading.Lock()
         self._conn()
+        self._counter    = RowCounter(self._conn, ("dns_events",))
         log.info("DNS DB    : %s  (retain %d days)", self.path, self.retain_days)
 
     # ── Connection / schema ───────────────────────────────────────────────────
@@ -76,23 +82,19 @@ class DnsDB:
     # ── Timestamp helper (identical to AlertDB) ───────────────────────────────
 
     def _to_epoch(self, ts: str) -> float:
-        if not ts:
-            return 0.0
-        normalised = _RE_USEC.sub(r"\1", ts)
-        normalised = _RE_TZ.sub(r"\1:\2", normalised)
-        for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
-            try:
-                return datetime.strptime(normalised, fmt).timestamp()
-            except ValueError:
-                pass
-        return 0.0
+        # Fast exact parser; like the original, fails silently (0.0)
+        return _fast_to_epoch(ts, warn=False)
 
     # ── Insert ────────────────────────────────────────────────────────────────
 
-    def insert(self, evt: dict):
-        """
-        Persist one DNS event from eve.json.
+    _SQL = """INSERT OR IGNORE INTO dns_events
+                   (id, ts, ts_epoch, src_ip, src_port, dst_ip, dst_port,
+                    iface, flow_id, tx_id, dns_type, rrname, rrtype,
+                    rcode, ttl, answers)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
 
+    def _row(self, evt: dict) -> tuple:
+        """
         Unique ID: flow_id + tx_id + dns_type + rrname
         Previously the ID omitted rrname, causing all events with tx_id=0
         (very common in Suricata) to collide and be silently dropped by
@@ -111,27 +113,39 @@ class DnsDB:
         )
 
         answers_json = json.dumps(d.get("answers", d.get("grouped", {})) or [])
+        return (uid, ts, self._to_epoch(ts),
+                evt.get("src_ip", ""),  evt.get("src_port", 0),
+                evt.get("dest_ip", ""), evt.get("dest_port", 0),
+                evt.get("in_iface", ""), evt.get("flow_id", 0),
+                d.get("tx_id", 0),      d.get("type", ""),
+                rrname,                 d.get("rrtype", ""),
+                d.get("rcode", ""),     d.get("ttl", 0),
+                answers_json)
 
+    def insert(self, evt: dict):
+        """Persist one DNS event from eve.json."""
         try:
-            c = self._conn()
-            c.execute(
-                """INSERT OR IGNORE INTO dns_events
-                   (id, ts, ts_epoch, src_ip, src_port, dst_ip, dst_port,
-                    iface, flow_id, tx_id, dns_type, rrname, rrtype,
-                    rcode, ttl, answers)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (uid, ts, self._to_epoch(ts),
-                 evt.get("src_ip", ""),  evt.get("src_port", 0),
-                 evt.get("dest_ip", ""), evt.get("dest_port", 0),
-                 evt.get("in_iface", ""), evt.get("flow_id", 0),
-                 d.get("tx_id", 0),      d.get("type", ""),
-                 rrname,                 d.get("rrtype", ""),
-                 d.get("rcode", ""),     d.get("ttl", 0),
-                 answers_json),
-            )
-            c.commit()
+            n = write_with_retry(self._conn(),
+                                 lambda c: c.execute(self._SQL, self._row(evt)).rowcount,
+                                 "DNS insert", lock=self._write_lock)
+            self._counter.add("dns_events", n)
         except sqlite3.Error as e:
             log.warning("DNS DB insert: %s", e)
+
+    def insert_batch(self, events):
+        """Insert many DNS events in one transaction (group commit)."""
+        if not events:
+            return
+        try:
+            rows = [self._row(e) for e in events]
+            n = write_with_retry(self._conn(),
+                                 lambda c: c.executemany(self._SQL, rows).rowcount,
+                                 "DNS batch", lock=self._write_lock)
+            self._counter.add("dns_events", n)
+        except (sqlite3.Error, TypeError, ValueError) as e:
+            log.warning("DNS batch insert failed (%s) — retrying row by row.", e)
+            for ev in events:
+                self.insert(ev)
 
     # ── Fetch ─────────────────────────────────────────────────────────────────
 
@@ -145,6 +159,8 @@ class DnsDB:
         conn   = self._conn()
 
         total = kwargs.get("_precomputed_total")
+        if total is None and (days or self.retain_days) >= self.retain_days:
+            total = self._counter.get("dns_events")     # O(1), no COUNT(*)
         if total is None:
             total = conn.execute(
                 "SELECT COUNT(*) FROM dns_events WHERE ts_epoch >= ?", (cutoff,)
@@ -174,38 +190,27 @@ class DnsDB:
 
     def flush_all(self) -> int:
         """Delete all DNS records. Returns deleted count."""
-        conn = self._conn()
-        cur  = conn.execute("DELETE FROM dns_events")
-        conn.commit()
-        return cur.rowcount
+        n = delete_in_chunks(self._conn(), "dns_events", lock=self._write_lock)
+        self._counter.add("dns_events", -n)
+        return n
 
     def purge_old(self):
         cutoff = time.time() - self.retain_days * 86400
-        c      = self._conn()
-        cur    = c.execute(
-            "DELETE FROM dns_events WHERE ts_epoch < ?", (cutoff,)
-        )
-        c.commit()
-        if cur.rowcount:
-            log.info("DNS DB: purged %d old rows.", cur.rowcount)
+        n = delete_in_chunks(self._conn(), "dns_events", "ts_epoch < ?", (cutoff,), lock=self._write_lock)
+        self._counter.add("dns_events", -n)
+        if n:
+            log.info("DNS DB: purged %d old rows.", n)
 
     def clear(self) -> int:
-        c   = self._conn()
-        cur = c.execute("DELETE FROM dns_events")
-        c.commit()
-        log.info("DNS DB cleared — %d rows deleted.", cur.rowcount)
-        return cur.rowcount
+        n = delete_in_chunks(self._conn(), "dns_events", lock=self._write_lock)
+        self._counter.add("dns_events", -n)
+        log.info("DNS DB cleared — %d rows deleted.", n)
+        return n
 
     def count(self) -> int:
-        return self._conn().execute(
-            "SELECT COUNT(*) FROM dns_events"
-        ).fetchone()[0]
+        return self._counter.get("dns_events")
 
     def stats(self) -> dict:
-        c      = self._conn()
-        cutoff = time.time() - self.retain_days * 86400
-        total  = c.execute("SELECT COUNT(*) FROM dns_events").fetchone()[0]
-        recent = c.execute(
-            "SELECT COUNT(*) FROM dns_events WHERE ts_epoch >= ?", (cutoff,)
-        ).fetchone()[0]
-        return {"total": total, "recent": recent}
+        total = self._counter.get("dns_events")
+        # rows past the retention window exist only until the hourly purge
+        return {"total": total, "recent": total}
